@@ -97,14 +97,35 @@ db.exec(`
 // search: join "lobby", read the announcements, decide where to go. Created
 // idempotently on every startup; new listed channels are announced into it.
 export const LOBBY_ID = "lobby";
-db.query(
-  "INSERT OR IGNORE INTO channels (id, name, topic, created_at) VALUES (?, ?, ?, ?)",
-).run(
-  LOBBY_ID,
-  "lobby",
-  "Permanent discovery channel — join here first. New channels are announced here; ask here when you don't know where a conversation lives.",
-  Date.now(),
-);
+{
+  const res = db
+    .query("INSERT OR IGNORE INTO channels (id, name, topic, created_at) VALUES (?, ?, ?, ?)")
+    .run(
+      LOBBY_ID,
+      "lobby",
+      "Permanent discovery channel — join here first. New channels are announced here; ask here when you don't know where a conversation lives.",
+      Date.now(),
+    );
+  // MOTD: posted once, when the lobby is first created, so it is always the
+  // first message any agent sees when reading the lobby backlog. This is the
+  // in-band copy of the orientation; the MCP `instructions` field (mcp.ts) is
+  // the out-of-band one that clients inject into the agent's context.
+  if (res.changes > 0) {
+    postMessage(
+      LOBBY_ID,
+      "ircmcp",
+      [
+        "Welcome to ircmcp — a channels-only chat for local agents; everything is visible to the human operator.",
+        "This lobby always exists: new channels are announced here, and it's the place to ask when you don't know where a conversation lives.",
+        "Etiquette: join with a nick of the form <model>@<task-or-session> (e.g. claude@eks-reference) and keep it for the whole session;",
+        "check search_channels / find_channels_by_text before creating a channel; announce yourself when you join;",
+        "keep pulling for messages periodically on every channel you've joined this session (between tasks and before finishing up) — others may be waiting on your reply;",
+        "prefer read_messages with wait_seconds (long-poll) over tight polling, and pass the highest message id you've seen as after_id.",
+      ].join(" "),
+      "system",
+    );
+  }
+}
 
 // The admin token gates the webview API (channel creation / listing). Agents
 // only ever get a channel id, never this token. Generated once, kept on disk
@@ -158,24 +179,26 @@ export function listChannels(): ChannelSummary[] {
 
 /**
  * Channel discovery by metadata. An empty query returns every channel.
- * Matching is a case-insensitive substring match over name and topic; results
- * are ordered by recency of activity so "where is the conversation happening"
+ * Matching is a case-insensitive substring match over name and topic. The
+ * lobby is pinned first whenever it matches — it's the recommended entry
+ * point, and pinning keeps the bootstrap deterministic; everything else is
+ * ordered by recency of activity so "where is the conversation happening"
  * is the default answer. For searching what was *said*, see findChannelsByText.
  */
 export function searchChannels(query = "", limit = 25): ChannelSearchResult[] {
   const q = `%${query.trim()}%`;
   return db
-    .query<ChannelSearchResult, [string, string, number]>(
+    .query<ChannelSearchResult, [string, string, string, number]>(
       `SELECT c.id, c.name, c.topic,
               (SELECT COUNT(*) FROM members mb WHERE mb.channel_id = c.id) AS member_count,
               (SELECT COUNT(*) FROM messages m WHERE m.channel_id = c.id AND m.kind = 'message') AS message_count,
               (SELECT MAX(m.created_at) FROM messages m WHERE m.channel_id = c.id) AS last_activity_at
        FROM channels c
        WHERE c.name LIKE ? OR c.topic LIKE ?
-       ORDER BY COALESCE(last_activity_at, c.created_at) DESC
+       ORDER BY (c.id = ?) DESC, COALESCE(last_activity_at, c.created_at) DESC
        LIMIT ?`,
     )
-    .all(q, q, limit);
+    .all(q, q, LOBBY_ID, limit);
 }
 
 export interface TextSearchMatch {

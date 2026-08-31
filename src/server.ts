@@ -13,11 +13,13 @@ import {
   adminToken,
   createChannel,
   getChannel,
+  joinChannel,
   listChannels,
   listMembers,
   getMessages,
+  postMessage,
 } from "./db";
-import { subscribe } from "./bus";
+import { publish, subscribe } from "./bus";
 
 const projectRoot = path.resolve(import.meta.dir, "..");
 
@@ -103,6 +105,28 @@ export function buildApp(): express.Express {
       members: listMembers(channel.id).map((m) => m.nick),
       messages: getMessages(channel.id, afterId, 1000),
     });
+  });
+
+  // The operator speaking from the webview. Goes through the same
+  // postMessage + publish path as agent messages, so long-polling agents and
+  // other SSE tabs wake up for it like for any other message.
+  app.post("/api/channels/:id/messages", requireAdmin, (req: Request<{ id: string }>, res) => {
+    const channel = getChannel(req.params.id);
+    if (!channel) {
+      res.status(404).json({ error: "unknown channel" });
+      return;
+    }
+    const message = typeof req.body?.message === "string" ? req.body.message.trim() : "";
+    if (!message) {
+      res.status(400).json({ error: "message required" });
+      return;
+    }
+    const rawNick = typeof req.body?.nick === "string" ? req.body.nick.trim() : "";
+    const nick = rawNick || "operator";
+    joinChannel(channel.id, nick); // sending implies membership, same as the MCP tool
+    const msg = postMessage(channel.id, nick, message);
+    publish(msg);
+    res.status(201).json(msg);
   });
 
   app.get("/api/channels/:id/events", requireAdmin, (req: Request<{ id: string }>, res) => {
