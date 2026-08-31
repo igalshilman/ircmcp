@@ -6,13 +6,12 @@ import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import path from "node:path";
 
-export type MessageKind = "message" | "join";
+export type MessageKind = "message" | "join" | "system";
 
 export interface Channel {
   id: string;
   name: string;
   topic: string;
-  listed: number; // sqlite boolean: 1 = discoverable via search, 0 = join-by-id only
   created_at: number;
 }
 
@@ -21,7 +20,7 @@ export interface ChannelSummary extends Channel {
   member_count: number;
 }
 
-/** What search_channels exposes to agents — listed channels only. */
+/** What search_channels exposes to agents. */
 export interface ChannelSearchResult {
   id: string;
   name: string;
@@ -58,7 +57,6 @@ db.exec(`
     id         TEXT PRIMARY KEY,
     name       TEXT NOT NULL,
     topic      TEXT NOT NULL DEFAULT '',
-    listed     INTEGER NOT NULL DEFAULT 1, -- 1 = discoverable via search_channels
     created_at INTEGER NOT NULL
   );
 
@@ -68,7 +66,7 @@ db.exec(`
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     channel_id TEXT NOT NULL REFERENCES channels(id),
     nick       TEXT NOT NULL,
-    kind       TEXT NOT NULL DEFAULT 'message', -- 'message' | 'join'
+    kind       TEXT NOT NULL DEFAULT 'message', -- 'message' | 'join' | 'system'
     body       TEXT NOT NULL,
     created_at INTEGER NOT NULL
   );
@@ -80,19 +78,33 @@ db.exec(`
     joined_at  INTEGER NOT NULL,
     PRIMARY KEY (channel_id, nick)
   );
+
+  -- Full-text index over message bodies (fts5, external content), kept in
+  -- sync by the insert trigger — messages are append-only, so inserts are the
+  -- only write path. Powers find_channels_by_text.
+  CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    body,
+    content='messages',
+    content_rowid='id'
+  );
+  CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);
+  END;
 `);
 
-// Migration for databases created before topic/listed existed. Old channels
-// become listed — they predate the distinction and hiding them would silently
-// break discovery of channels the operator already handed out.
-{
-  const cols = db
-    .query<{ name: string }, []>("PRAGMA table_info(channels)")
-    .all()
-    .map((c) => c.name);
-  if (!cols.includes("topic")) db.exec("ALTER TABLE channels ADD COLUMN topic TEXT NOT NULL DEFAULT ''");
-  if (!cols.includes("listed")) db.exec("ALTER TABLE channels ADD COLUMN listed INTEGER NOT NULL DEFAULT 1");
-}
+// The lobby is the one channel that always exists, under a well-known id, so
+// agents have a bootstrap point that needs no operator-handed id and no
+// search: join "lobby", read the announcements, decide where to go. Created
+// idempotently on every startup; new listed channels are announced into it.
+export const LOBBY_ID = "lobby";
+db.query(
+  "INSERT OR IGNORE INTO channels (id, name, topic, created_at) VALUES (?, ?, ?, ?)",
+).run(
+  LOBBY_ID,
+  "lobby",
+  "Permanent discovery channel — join here first. New channels are announced here; ask here when you don't know where a conversation lives.",
+  Date.now(),
+);
 
 // The admin token gates the webview API (channel creation / listing). Agents
 // only ever get a channel id, never this token. Generated once, kept on disk
@@ -103,29 +115,40 @@ if (!existsSync(tokenPath)) {
 }
 export const adminToken = readFileSync(tokenPath, "utf8").trim();
 
-export function createChannel(name: string, topic = "", listed = true): Channel {
+export function createChannel(name: string, topic = ""): Channel {
   const created = Date.now();
   const id = "ch_" + randomBytes(16).toString("hex");
-  db.query("INSERT INTO channels (id, name, topic, listed, created_at) VALUES (?, ?, ?, ?, ?)").run(
+  db.query("INSERT INTO channels (id, name, topic, created_at) VALUES (?, ?, ?, ?)").run(
     id,
     name,
     topic,
-    listed ? 1 : 0,
     created,
   );
-  return { id, name, topic, listed: listed ? 1 : 0, created_at: created };
+  return { id, name, topic, created_at: created };
+}
+
+/**
+ * Used by create_channel to keep names unique-ish: two channels with the same
+ * name would split one conversation between racing agents.
+ */
+export function findChannelByName(name: string): Channel | null {
+  return db
+    .query<Channel, [string]>(
+      "SELECT id, name, topic, created_at FROM channels WHERE name = ? COLLATE NOCASE",
+    )
+    .get(name);
 }
 
 export function getChannel(id: string): Channel | null {
   return db
-    .query<Channel, [string]>("SELECT id, name, topic, listed, created_at FROM channels WHERE id = ?")
+    .query<Channel, [string]>("SELECT id, name, topic, created_at FROM channels WHERE id = ?")
     .get(id);
 }
 
 export function listChannels(): ChannelSummary[] {
   return db
     .query<ChannelSummary, []>(
-      `SELECT c.id, c.name, c.topic, c.listed, c.created_at,
+      `SELECT c.id, c.name, c.topic, c.created_at,
               (SELECT COUNT(*) FROM messages m WHERE m.channel_id = c.id AND m.kind = 'message') AS message_count,
               (SELECT COUNT(*) FROM members mb WHERE mb.channel_id = c.id) AS member_count
        FROM channels c ORDER BY c.created_at DESC`,
@@ -134,11 +157,10 @@ export function listChannels(): ChannelSummary[] {
 }
 
 /**
- * Channel discovery for agents. Only listed channels are visible; unlisted
- * ones stay join-by-id-only no matter what the query is. An empty query
- * returns every listed channel. Matching is a case-insensitive substring
- * match over name and topic; results are ordered by recency of activity so
- * "where is the conversation happening" is the default answer.
+ * Channel discovery by metadata. An empty query returns every channel.
+ * Matching is a case-insensitive substring match over name and topic; results
+ * are ordered by recency of activity so "where is the conversation happening"
+ * is the default answer. For searching what was *said*, see findChannelsByText.
  */
 export function searchChannels(query = "", limit = 25): ChannelSearchResult[] {
   const q = `%${query.trim()}%`;
@@ -149,11 +171,75 @@ export function searchChannels(query = "", limit = 25): ChannelSearchResult[] {
               (SELECT COUNT(*) FROM messages m WHERE m.channel_id = c.id AND m.kind = 'message') AS message_count,
               (SELECT MAX(m.created_at) FROM messages m WHERE m.channel_id = c.id) AS last_activity_at
        FROM channels c
-       WHERE c.listed = 1 AND (c.name LIKE ? OR c.topic LIKE ?)
+       WHERE c.name LIKE ? OR c.topic LIKE ?
        ORDER BY COALESCE(last_activity_at, c.created_at) DESC
        LIMIT ?`,
     )
     .all(q, q, limit);
+}
+
+export interface TextSearchMatch {
+  message_id: number;
+  nick: string;
+  created_at: number;
+  snippet: string;
+}
+
+export interface TextSearchChannelResult {
+  id: string;
+  name: string;
+  topic: string;
+  match_count: number;
+  last_match_at: number;
+  top_matches: TextSearchMatch[];
+}
+
+/**
+ * Turn arbitrary user text into a safe fts5 MATCH query: each whitespace-
+ * separated word becomes a quoted term (so fts5 operator characters in the
+ * input can't break the query), joined by implicit AND. Returns null when
+ * there's nothing to search for.
+ */
+function ftsQuery(text: string): string | null {
+  const terms = text
+    .split(/\s+/)
+    .map((t) => t.replaceAll('"', '""'))
+    .filter(Boolean);
+  if (terms.length === 0) return null;
+  return terms.map((t) => `"${t}"`).join(" ");
+}
+
+/**
+ * Full-text search over message bodies, grouped by channel: "where is this
+ * being discussed?". Channels come back most-recently-matched first, each
+ * with its best-ranked snippets. join/system messages are excluded — they're
+ * boilerplate, not conversation.
+ */
+export function findChannelsByText(text: string, limit = 10): TextSearchChannelResult[] | null {
+  const q = ftsQuery(text);
+  if (q === null) return null;
+  const channels = db
+    .query<Omit<TextSearchChannelResult, "top_matches">, [string, number]>(
+      `SELECT c.id, c.name, c.topic, COUNT(*) AS match_count, MAX(m.created_at) AS last_match_at
+       FROM messages_fts
+       JOIN messages m ON m.id = messages_fts.rowid
+       JOIN channels c ON c.id = m.channel_id
+       WHERE messages_fts MATCH ? AND m.kind = 'message'
+       GROUP BY c.id
+       ORDER BY last_match_at DESC
+       LIMIT ?`,
+    )
+    .all(q, limit);
+  const topMatches = db.query<TextSearchMatch, [string, string]>(
+    `SELECT m.id AS message_id, m.nick, m.created_at,
+            snippet(messages_fts, 0, '«', '»', ' … ', 12) AS snippet
+     FROM messages_fts
+     JOIN messages m ON m.id = messages_fts.rowid
+     WHERE messages_fts MATCH ? AND m.channel_id = ? AND m.kind = 'message'
+     ORDER BY rank
+     LIMIT 3`,
+  );
+  return channels.map((c) => ({ ...c, top_matches: topMatches.all(q, c.id) }));
 }
 
 /** Returns true if the nick was new to the channel. */

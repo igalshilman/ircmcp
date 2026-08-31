@@ -8,7 +8,7 @@
 import express, { type RequestHandler, type Request, type Response } from "express";
 import path from "node:path";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { buildMcpServer } from "./mcp";
+import { announceNewChannel, buildMcpServer } from "./mcp";
 import {
   adminToken,
   createChannel,
@@ -86,8 +86,9 @@ export function buildApp(): express.Express {
       return;
     }
     const topic = typeof req.body?.topic === "string" ? req.body.topic.trim() : "";
-    const listed = req.body?.listed !== false; // discoverable unless explicitly unlisted
-    res.status(201).json(createChannel(name, topic, listed));
+    const channel = createChannel(name, topic);
+    announceNewChannel("operator", channel);
+    res.status(201).json(channel);
   });
 
   app.get("/api/channels/:id/messages", requireAdmin, (req: Request<{ id: string }>, res) => {

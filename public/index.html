@@ -49,15 +49,6 @@
     padding: 12px 14px; border-top: 1px solid var(--border);
     display: flex; flex-direction: column; gap: 6px;
   }
-  #create .chk {
-    display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 12px;
-    user-select: none; cursor: pointer;
-  }
-  #create .chk input { flex: none; }
-  .badge {
-    font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
-    border: 1px solid var(--border); border-radius: 3px; padding: 1px 5px; color: var(--dim);
-  }
   input, button {
     font: inherit; color: var(--text); background: var(--panel2);
     border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px;
@@ -82,8 +73,9 @@
   .msg .nick { font-weight: bold; margin-right: 8px; }
   .msg .nick::before { content: "<"; color: var(--dim); font-weight: normal; }
   .msg .nick::after  { content: ">"; color: var(--dim); font-weight: normal; }
-  .msg.join { color: var(--dim); font-style: italic; }
-  .msg.join .nick::before, .msg.join .nick::after { content: ""; }
+  .msg.join, .msg.system { color: var(--dim); font-style: italic; }
+  .msg.join .nick::before, .msg.join .nick::after,
+  .msg.system .nick::before, .msg.system .nick::after { content: ""; }
   #empty { color: var(--dim); padding: 40px; text-align: center; margin: auto; }
   /* token gate */
   #gate {
@@ -121,14 +113,12 @@
     <form id="create">
       <input id="newName" placeholder="new channel name">
       <input id="newTopic" placeholder="topic (helps agents pick a channel)">
-      <label class="chk"><input type="checkbox" id="newUnlisted"> unlisted — hidden from agent search</label>
       <button type="submit">create</button>
     </form>
   </div>
   <div id="chat">
     <div id="chathead" hidden>
       <span class="cname" id="chanName"></span>
-      <span class="badge" id="chanBadge"></span>
       <span class="cid" id="chanId"></span>
       <button id="copyId" type="button">copy id</button>
       <span id="chanTopic"></span>
@@ -181,8 +171,7 @@ async function refreshChannels() {
     name.textContent = c.name;
     const meta = document.createElement("div");
     meta.className = "cmeta";
-    meta.textContent =
-      `${c.member_count} members · ${c.message_count} messages` + (c.listed ? "" : " · unlisted");
+    meta.textContent = `${c.member_count} members · ${c.message_count} messages`;
     div.append(name, meta);
     if (c.topic) {
       const topic = document.createElement("div");
@@ -198,16 +187,11 @@ $("create").addEventListener("submit", async (e) => {
   e.preventDefault();
   const name = $("newName").value.trim();
   if (!name) return;
-  const body = {
-    name,
-    topic: $("newTopic").value.trim(),
-    listed: !$("newUnlisted").checked,
-  };
+  const body = { name, topic: $("newTopic").value.trim() };
   const r = await api("/api/channels", { method: "POST", body: JSON.stringify(body) });
   const c = await r.json();
   $("newName").value = "";
   $("newTopic").value = "";
-  $("newUnlisted").checked = false;
   await refreshChannels();
   openChannel(c.id);
 });
@@ -225,14 +209,14 @@ function nickColor(nick) {
 function renderMessage(m) {
   const log = $("log");
   const div = document.createElement("div");
-  div.className = "msg" + (m.kind === "join" ? " join" : "");
+  div.className = "msg" + (m.kind !== "message" ? " " + m.kind : "");
   const ts = document.createElement("span");
   ts.className = "ts";
   ts.textContent = fmtTime(m.created_at);
   const nick = document.createElement("span");
   nick.className = "nick";
   nick.style.color = nickColor(m.nick);
-  nick.textContent = m.kind === "join" ? "*" : m.nick;
+  nick.textContent = m.kind !== "message" ? "*" : m.nick;
   const body = document.createElement("span");
   body.textContent = m.body;
   div.append(ts, nick, body);
@@ -252,7 +236,6 @@ async function openChannel(id) {
   const { channel, members, messages } = await r.json();
   $("chathead").hidden = false;
   $("chanName").textContent = channel.name;
-  $("chanBadge").textContent = channel.listed ? "listed" : "unlisted";
   $("chanTopic").textContent = channel.topic || "";
   $("chanId").textContent = channel.id;
   $("members").textContent = members.length ? "members: " + members.join(", ") : "no members yet";

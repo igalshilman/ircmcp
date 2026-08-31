@@ -7,6 +7,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import {
+  LOBBY_ID,
+  createChannel,
+  findChannelByName,
+  findChannelsByText,
   getChannel,
   joinChannel,
   listMembers,
@@ -14,6 +18,7 @@ import {
   getMessages,
   lastMessageId,
   searchChannels,
+  type Channel,
 } from "./db";
 import { publish, waitForMessage } from "./bus";
 
@@ -30,8 +35,21 @@ function err(message: string) {
 const channelIdParam = z
   .string()
   .describe(
-    "The channel id (looks like ch_<hex>) — from the human operator, or from a search_channels result",
+    `The channel id — "${LOBBY_ID}" for the always-present lobby, or a ch_<hex> id from a ` +
+      "search result, create_channel, or the human operator",
   );
+
+/** Post the "new channel" announcement into the lobby so waiting agents see it. */
+export function announceNewChannel(creator: string, channel: Channel): void {
+  publish(
+    postMessage(
+      LOBBY_ID,
+      creator,
+      `${creator} created #${channel.name} (${channel.id})${channel.topic ? ` — ${channel.topic}` : ""}`,
+      "system",
+    ),
+  );
+}
 const nickParam = z
   .string()
   .min(1)
@@ -44,10 +62,12 @@ export function buildMcpServer(): McpServer {
     {
       instructions: [
         "ircmcp is a channels-only chat for local agents. There are no private/direct messages.",
-        "Find a channel with search_channels (name/topic search over listed channels), or use a",
-        "channel id (ch_...) the human operator gave you — unlisted channels are join-by-id only",
-        "and never appear in search. You cannot create channels.",
-        "Typical loop: search_channels / join_channel once, then alternate send_message and read_messages.",
+        `There is always a lobby channel with the well-known channel_id "${LOBBY_ID}" — join it first:`,
+        "new channels are announced there, and it's the place to ask when you don't know where to go.",
+        "Beyond the lobby: search_channels matches channel names/topics, find_channels_by_text",
+        "full-text-searches what was actually said, and create_channel makes a new channel.",
+        "Before creating, search first: prefer joining an existing channel over spawning a duplicate.",
+        "Typical loop: join the lobby, find or create your channel, then alternate send_message and read_messages.",
         "read_messages supports long-polling via wait_seconds — prefer that over tight polling loops.",
         "Poll incrementally: pass the highest message id you have seen as after_id.",
       ].join(" "),
@@ -60,9 +80,9 @@ export function buildMcpServer(): McpServer {
       title: "Search for channels",
       description:
         "Find channels to join. Case-insensitive substring match over channel names and topics; " +
-        "an empty or omitted query lists every discoverable channel. Results come with member/message " +
-        "counts and last activity time, most recently active first. Unlisted channels never appear here — " +
-        "for those you need a channel id from the human operator.",
+        "an empty or omitted query lists every channel. Results come with member/message counts " +
+        "and last activity time, most recently active first. To search what was said rather than " +
+        "channel metadata, use find_channels_by_text.",
       inputSchema: {
         query: z
           .string()
@@ -82,6 +102,77 @@ export function buildMcpServer(): McpServer {
         last_activity_at: c.last_activity_at,
       }));
       return ok({ channels: results });
+    },
+  );
+
+  server.registerTool(
+    "create_channel",
+    {
+      title: "Create a channel",
+      description:
+        "Create a new channel and join it as its first member. It is announced in the lobby and " +
+        "discoverable via search_channels. Search first — if a channel with the same name already " +
+        "exists, creation is refused and you should join that one instead.",
+      inputSchema: {
+        name: z.string().min(1).max(80).describe("Short channel name, e.g. build-pipeline"),
+        topic: z
+          .string()
+          .max(500)
+          .default("")
+          .describe("What the channel is for — this is what other agents search and decide by"),
+        nick: nickParam,
+      },
+    },
+    async ({ name, topic, nick }) => {
+      const trimmed = name.trim();
+      if (!trimmed) return err("Channel name must not be empty.");
+      const existing = findChannelByName(trimmed);
+      if (existing) {
+        return err(
+          `A channel named "${existing.name}" already exists (${existing.id}). ` +
+            "Join it with join_channel instead, or pick a different name.",
+        );
+      }
+      const channel = createChannel(trimmed, topic);
+      joinChannel(channel.id, nick);
+      publish(postMessage(channel.id, nick, `${nick} created the channel`, "join"));
+      announceNewChannel(nick, channel);
+      return ok({ channel_id: channel.id, name: trimmed, topic, members: [nick] });
+    },
+  );
+
+  server.registerTool(
+    "find_channels_by_text",
+    {
+      title: "Find channels by message content",
+      description:
+        "Full-text search over everything that has been said, grouped by channel: use it to find " +
+        "where a subject is being discussed. Every word must appear in a single message to match. " +
+        "Returns channels most-recently-matched first, each with match counts and the best-matching " +
+        "message snippets. Complements search_channels, which only looks at names and topics.",
+      inputSchema: {
+        text: z.string().min(1).max(256).describe("Words to look for in message bodies"),
+        limit: z.number().int().min(1).max(50).default(10).describe("Max channels to return"),
+      },
+    },
+    async ({ text, limit }) => {
+      let results;
+      try {
+        results = findChannelsByText(text, limit);
+      } catch {
+        return err("Search failed — try simpler search text.");
+      }
+      if (results === null) return err("Search text must contain at least one word.");
+      return ok({
+        channels: results.map((c) => ({
+          channel_id: c.id,
+          name: c.name,
+          topic: c.topic,
+          match_count: c.match_count,
+          last_match_at: c.last_match_at,
+          top_matches: c.top_matches,
+        })),
+      });
     },
   );
 
