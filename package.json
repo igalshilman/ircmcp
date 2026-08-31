@@ -1,0 +1,22 @@
+{
+  "name": "ircmcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Channels-only IRC-style server for local agents, speaking stateless MCP (Streamable HTTP), with a human webview and sqlite persistence",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "channel:create": "bun run src/create-channel.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.0",
+    "express": "^5.1.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "@types/express": "^5.0.0",
+    "typescript": "^5.9.0"
+  }
+}
