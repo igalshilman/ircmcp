@@ -38,6 +38,12 @@
     color: var(--dim); font-size: 12px; margin-top: 2px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
+  .sr .srsnip:hover { color: var(--text); }
+  @keyframes flashbg {
+    0%, 40% { background: var(--accent2); }
+    100% { background: var(--panel); }
+  }
+  .msg.flash { animation: flashbg 2.5s ease-out; }
   header .status { color: var(--dim); font-size: 12px; }
   main { flex: 1; display: flex; min-height: 0; }
   #sidebar {
@@ -298,6 +304,7 @@ function nickColor(nick) {
 function renderMessage(m) {
   const log = $("log");
   const div = document.createElement("div");
+  div.dataset.id = m.id; // anchor for "jump to message" from search
   const ts = document.createElement("span");
   ts.className = "ts";
   ts.textContent = fmtTime(m.created_at);
@@ -353,7 +360,7 @@ function renderHeaderTags(tags) {
   }
 }
 
-async function openChannel(id) {
+async function openChannel(id, focusId) {
   current = id;
   lastId = 0;
   delete unread[id];
@@ -371,7 +378,14 @@ async function openChannel(id) {
   $("chanId").textContent = channel.id;
   $("members").textContent = members.length ? "members: " + members.join(", ") : "no members yet";
   for (const m of messages) renderMessage(m);
-  $("log").scrollTop = $("log").scrollHeight;
+  const focusEl = focusId && $("log").querySelector(`[data-id="${focusId}"]`);
+  if (focusEl) {
+    focusEl.scrollIntoView({ block: "center" });
+    focusEl.classList.add("flash");
+    setTimeout(() => focusEl.classList.remove("flash"), 2600);
+  } else {
+    $("log").scrollTop = $("log").scrollHeight;
+  }
   refreshChannels();
 
   // Live tail. On (re)connect we could have missed messages, so the SSE
@@ -483,17 +497,22 @@ $("searchBox").addEventListener("keydown", async (e) => {
     name.className = "srname";
     name.textContent = `#${c.name} — ${c.match_count} match${c.match_count === 1 ? "" : "es"}`;
     d.appendChild(name);
+    const jump = (messageId) => {
+      box.hidden = true;
+      $("searchBox").value = "";
+      openChannel(c.id, messageId);
+    };
     for (const m of c.top_matches) {
       const s = document.createElement("div");
       s.className = "srsnip";
       s.textContent = `${m.nick}: ${m.snippet}`;
+      s.onclick = (ev) => {
+        ev.stopPropagation(); // each snippet jumps to its own message
+        jump(m.message_id);
+      };
       d.appendChild(s);
     }
-    d.onclick = () => {
-      box.hidden = true;
-      $("searchBox").value = "";
-      openChannel(c.id);
-    };
+    d.onclick = () => jump(c.top_matches[0]?.message_id);
     box.appendChild(d);
   }
   box.hidden = false;
