@@ -76,12 +76,12 @@
     padding: 12px 14px; border-top: 1px solid var(--border);
     display: flex; flex-direction: column; gap: 6px;
   }
-  input, button {
+  input, textarea, button {
     font: inherit; color: var(--text); background: var(--panel2);
     border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px;
   }
   input { flex: 1; min-width: 0; }
-  input:focus { outline: none; border-color: var(--accent); }
+  input:focus, textarea:focus { outline: none; border-color: var(--accent); }
   button { cursor: pointer; white-space: nowrap; }
   button:hover { border-color: var(--accent); color: var(--accent); }
   #chat { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
@@ -105,9 +105,11 @@
   #composer {
     display: flex; gap: 6px; padding: 10px 16px;
     border-top: 1px solid var(--border); background: var(--panel);
+    align-items: flex-end; /* nick + send stay bottom-aligned as the textarea grows */
   }
   #composer[hidden] { display: none; }
   #nick { flex: none; width: 120px; }
+  #msgInput { flex: 1; min-width: 0; resize: none; max-height: 180px; line-height: 1.4; }
   /* Chat messages are block "cards": models emit walls of text, so each
      message needs an unmistakable boundary and author. The left accent
      border carries the author's color all the way down the block. */
@@ -188,7 +190,7 @@
     <div id="newMsgs" hidden>new messages ↓</div>
     <form id="composer" hidden>
       <input id="nick" title="your nick">
-      <input id="msgInput" placeholder="say something…" autocomplete="off">
+      <textarea id="msgInput" rows="1" placeholder="say something… (shift+enter to send, enter for newline)"></textarea>
       <button type="submit">send</button>
     </form>
   </div>
@@ -424,6 +426,19 @@ function openFirehose() {
 // ---- composer (operator speaking into the channel) ----
 try { $("nick").value = localStorage.getItem("ircmcp_nick") || "operator"; }
 catch { $("nick").value = "operator"; }
+// Enter = newline (models aren't the only ones writing walls of text);
+// shift+enter or cmd/ctrl+enter sends. The textarea grows with its content.
+$("msgInput").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.shiftKey || e.metaKey || e.ctrlKey)) {
+    e.preventDefault();
+    $("composer").requestSubmit();
+  }
+});
+$("msgInput").addEventListener("input", () => {
+  const ta = $("msgInput");
+  ta.style.height = "auto";
+  ta.style.height = Math.min(ta.scrollHeight, 180) + "px";
+});
 $("composer").addEventListener("submit", async (e) => {
   e.preventDefault();
   const text = $("msgInput").value.trim();
@@ -436,6 +451,7 @@ $("composer").addEventListener("submit", async (e) => {
   });
   if (!r.ok) return;
   $("msgInput").value = "";
+  $("msgInput").style.height = "auto";
   // Local echo; the SSE copy of the same message is deduped by the id guard.
   const m = await r.json();
   if (m.id > lastId) renderMessage(m);
