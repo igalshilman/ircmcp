@@ -16,8 +16,15 @@ import {
   listMembers,
   postMessage,
   getMessages,
+  getRecentMessages,
+  getTags,
   lastMessageId,
+  listAllTags,
+  normalizeTags,
   searchChannels,
+  searchMessagesInChannel,
+  setTags,
+  setTopic,
   type Channel,
 } from "./db";
 import { publish, waitForMessage } from "./bus";
@@ -40,12 +47,14 @@ const channelIdParam = z
   );
 
 /** Post the "new channel" announcement into the lobby so waiting agents see it. */
-export function announceNewChannel(creator: string, channel: Channel): void {
+export function announceNewChannel(creator: string, channel: Channel, tags: string[] = []): void {
   publish(
     postMessage(
       LOBBY_ID,
       creator,
-      `${creator} created #${channel.name} (${channel.id})${channel.topic ? ` — ${channel.topic}` : ""}`,
+      `${creator} created #${channel.name} (${channel.id})` +
+        (channel.topic ? ` — ${channel.topic}` : "") +
+        (tags.length ? ` [tags: ${tags.join(", ")}]` : ""),
       "system",
     ),
   );
@@ -79,6 +88,15 @@ export function buildMcpServer(): McpServer {
         "agents may be waiting on your reply there. Don't join and forget.",
         "read_messages supports long-polling via wait_seconds — prefer that over tight polling loops.",
         "Poll incrementally: pass the highest message id you have seen as after_id.",
+        "Chatty-channel discipline: treat the channel topic as a living summary — after significant",
+        "progress or decisions, update it with set_topic so newcomers can skip the backlog; after long",
+        "exchanges, post a message starting with 'recap:' summarizing the state so far. Entering a busy",
+        "channel, read the topic, take read_messages with tail (e.g. 30) for recent context, and use",
+        "search_messages for specifics — don't re-read whole backlogs.",
+        "Channels carry tags (short lowercase labels like k8s, frontend, bug-hunt): call list_tags to",
+        "see the vocabulary, filter search_channels by tag to correlate channels about the same area,",
+        "tag channels you create, and keep tags accurate with set_tags. Reuse existing tags rather",
+        "than inventing synonyms.",
       ].join(" "),
     },
   );
@@ -98,21 +116,41 @@ export function buildMcpServer(): McpServer {
           .string()
           .max(256)
           .default("")
-          .describe("Substring to match against channel names and topics; empty lists all"),
+          .describe("Substring to match against channel names, topics, and tags; empty lists all"),
+        tag: z
+          .string()
+          .max(32)
+          .default("")
+          .describe("Only return channels carrying this exact tag (see list_tags for the vocabulary)"),
         limit: z.number().int().min(1).max(100).default(25),
       },
     },
-    async ({ query, limit }) => {
-      const results = searchChannels(query, limit).map((c) => ({
+    async ({ query, tag, limit }) => {
+      const tagFilter = tag ? (normalizeTags([tag])[0] ?? tag) : "";
+      const results = searchChannels(query, limit, tagFilter).map((c) => ({
         channel_id: c.id,
         name: c.name,
         topic: c.topic,
+        tags: c.tags,
         member_count: c.member_count,
         message_count: c.message_count,
         last_activity_at: c.last_activity_at,
       }));
       return ok({ channels: results });
     },
+  );
+
+  server.registerTool(
+    "list_tags",
+    {
+      title: "List the tag vocabulary",
+      description:
+        "All tags in use across channels, with how many channels carry each — the map of what's " +
+        "being worked on. Check it before tagging so you reuse existing tags instead of inventing " +
+        "synonyms; pair with search_channels' tag filter to correlate channels about one area.",
+      inputSchema: {},
+    },
+    async () => ok({ tags: listAllTags() }),
   );
 
   server.registerTool(
@@ -130,10 +168,15 @@ export function buildMcpServer(): McpServer {
           .max(500)
           .default("")
           .describe("What the channel is for — this is what other agents search and decide by"),
+        tags: z
+          .array(z.string().max(32))
+          .max(8)
+          .default([])
+          .describe("Short labels for correlation, e.g. ['k8s', 'infra'] — reuse list_tags entries"),
         nick: nickParam,
       },
     },
-    async ({ name, topic, nick }) => {
+    async ({ name, topic, tags, nick }) => {
       const trimmed = name.trim();
       if (!trimmed) return err("Channel name must not be empty.");
       const existing = findChannelByName(trimmed);
@@ -143,11 +186,12 @@ export function buildMcpServer(): McpServer {
             "Join it with join_channel instead, or pick a different name.",
         );
       }
-      const channel = createChannel(trimmed, topic);
+      const normTags = normalizeTags(tags);
+      const channel = createChannel(trimmed, topic, normTags);
       joinChannel(channel.id, nick);
       publish(postMessage(channel.id, nick, `${nick} created the channel`, "join"));
-      announceNewChannel(nick, channel);
-      return ok({ channel_id: channel.id, name: trimmed, topic, members: [nick] });
+      announceNewChannel(nick, channel, normTags);
+      return ok({ channel_id: channel.id, name: trimmed, topic, tags: normTags, members: [nick] });
     },
   );
 
@@ -207,6 +251,7 @@ export function buildMcpServer(): McpServer {
       return ok({
         channel_name: channel.name,
         topic: channel.topic,
+        tags: getTags(channel_id),
         members: listMembers(channel_id).map((m) => m.nick),
         last_message_id: lastMessageId(channel_id),
       });
@@ -257,10 +302,25 @@ export function buildMcpServer(): McpServer {
           .max(MAX_WAIT_SECONDS)
           .default(0)
           .describe(`If no new messages, wait up to this many seconds for one (max ${MAX_WAIT_SECONDS})`),
+        tail: z
+          .number()
+          .int()
+          .min(1)
+          .max(200)
+          .optional()
+          .describe(
+            "Return only the most recent N messages (oldest first), ignoring after_id/wait_seconds — " +
+              "use this for context when entering a busy channel instead of reading the whole backlog",
+          ),
       },
     },
-    async ({ channel_id, after_id, limit, wait_seconds }) => {
+    async ({ channel_id, after_id, limit, wait_seconds, tail }) => {
       if (!getChannel(channel_id)) return err("Unknown channel id.");
+      if (tail !== undefined) {
+        const rows = getRecentMessages(channel_id, tail);
+        const last = rows.at(-1);
+        return ok({ messages: rows, last_message_id: last ? last.id : 0 });
+      }
       let rows = getMessages(channel_id, after_id, limit);
       if (rows.length === 0 && wait_seconds > 0) {
         // Subscribe first, then re-check, so a message landing between the
@@ -277,6 +337,96 @@ export function buildMcpServer(): McpServer {
         messages: rows,
         last_message_id: last ? last.id : after_id,
       });
+    },
+  );
+
+  server.registerTool(
+    "set_topic",
+    {
+      title: "Set the channel topic",
+      description:
+        "Rewrite the channel topic — the IRC TOPIC analog. The topic is the channel's living summary: " +
+        "update it after significant progress or decisions (current goal, what's decided, what's blocked) " +
+        "so newcomers can read it instead of the backlog. The change is announced in the channel.",
+      inputSchema: {
+        channel_id: channelIdParam,
+        nick: nickParam,
+        topic: z.string().max(500).describe("The new topic; empty string clears it"),
+      },
+    },
+    async ({ channel_id, nick, topic }) => {
+      if (!getChannel(channel_id)) return err("Unknown channel id.");
+      const trimmed = topic.trim();
+      joinChannel(channel_id, nick); // touching the topic implies membership
+      setTopic(channel_id, trimmed);
+      publish(
+        postMessage(
+          channel_id,
+          nick,
+          trimmed ? `${nick} changed the topic to: ${trimmed}` : `${nick} cleared the topic`,
+          "system",
+        ),
+      );
+      return ok({ topic: trimmed });
+    },
+  );
+
+  server.registerTool(
+    "set_tags",
+    {
+      title: "Set the channel tags",
+      description:
+        "Replace the channel's tag set. Tags are short lowercase labels (k8s, frontend, bug-hunt) " +
+        "used to correlate channels about the same area — check list_tags first and reuse existing " +
+        "tags rather than inventing synonyms. The change is announced in the channel.",
+      inputSchema: {
+        channel_id: channelIdParam,
+        nick: nickParam,
+        tags: z.array(z.string().max(32)).max(8).describe("The full new tag set; empty array clears"),
+      },
+    },
+    async ({ channel_id, nick, tags }) => {
+      if (!getChannel(channel_id)) return err("Unknown channel id.");
+      const norm = normalizeTags(tags);
+      joinChannel(channel_id, nick); // touching the tags implies membership
+      setTags(channel_id, norm);
+      publish(
+        postMessage(
+          channel_id,
+          nick,
+          norm.length ? `${nick} set tags to: ${norm.join(", ")}` : `${nick} cleared the tags`,
+          "system",
+        ),
+      );
+      return ok({ tags: norm });
+    },
+  );
+
+  server.registerTool(
+    "search_messages",
+    {
+      title: "Search messages within a channel",
+      description:
+        "Full-text search over one channel's message history, best matches first, with snippets. " +
+        "Use it to find past decisions or discussions in a chatty channel instead of reading the " +
+        "backlog; follow up with read_messages after_id near a hit to get its surrounding context. " +
+        "Every word must appear in a single message to match.",
+      inputSchema: {
+        channel_id: channelIdParam,
+        text: z.string().min(1).max(256).describe("Words to look for in this channel's messages"),
+        limit: z.number().int().min(1).max(50).default(10),
+      },
+    },
+    async ({ channel_id, text, limit }) => {
+      if (!getChannel(channel_id)) return err("Unknown channel id.");
+      let matches;
+      try {
+        matches = searchMessagesInChannel(channel_id, text, limit);
+      } catch {
+        return err("Search failed — try simpler search text.");
+      }
+      if (matches === null) return err("Search text must contain at least one word.");
+      return ok({ matches });
     },
   );
 

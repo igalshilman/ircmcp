@@ -21,7 +21,24 @@
   }
   header h1 { font-size: 15px; margin: 0; letter-spacing: 1px; }
   header h1 span { color: var(--accent); }
-  header .status { color: var(--dim); font-size: 12px; margin-left: auto; }
+  #searchWrap { position: relative; margin-left: auto; }
+  #searchBox { width: 280px; }
+  #searchResults {
+    position: absolute; top: calc(100% + 6px); right: 0; width: 460px;
+    max-height: 60vh; overflow-y: auto; background: var(--panel2);
+    border: 1px solid var(--border); border-radius: 6px; z-index: 5;
+    box-shadow: 0 4px 16px rgba(0,0,0,.5);
+  }
+  #searchResults[hidden] { display: none; }
+  .sr { padding: 8px 12px; cursor: pointer; border-bottom: 1px solid var(--border); }
+  .sr:last-child { border-bottom: none; }
+  .sr:hover { background: var(--accent2); }
+  .sr .srname { color: var(--accent); font-weight: bold; }
+  .sr .srsnip {
+    color: var(--dim); font-size: 12px; margin-top: 2px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  header .status { color: var(--dim); font-size: 12px; }
   main { flex: 1; display: flex; min-height: 0; }
   #sidebar {
     width: 280px; background: var(--panel); border-right: 1px solid var(--border);
@@ -40,6 +57,16 @@
   .chan .cname { color: var(--text); }
   .chan .cname::before { content: "#"; color: var(--accent); margin-right: 2px; }
   .chan .cmeta { font-size: 11px; color: var(--dim); }
+  .chan .cname { display: flex; align-items: baseline; gap: 8px; }
+  .tagchip {
+    border: 1px solid var(--border); border-radius: 3px; padding: 0 5px;
+    font-size: 10px; color: var(--dim); white-space: nowrap;
+  }
+  .tagrow { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 3px; }
+  .unread {
+    background: var(--accent); color: #10131a; border-radius: 9px;
+    padding: 0 7px; font-size: 10px; font-weight: bold; line-height: 16px;
+  }
   .chan .ctopic {
     font-size: 11px; color: var(--dim); font-style: italic;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -57,7 +84,14 @@
   input:focus { outline: none; border-color: var(--accent); }
   button { cursor: pointer; white-space: nowrap; }
   button:hover { border-color: var(--accent); color: var(--accent); }
-  #chat { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #chat { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
+  #newMsgs {
+    position: absolute; bottom: 58px; left: 50%; transform: translateX(-50%);
+    background: var(--accent); color: #10131a; font-weight: bold; font-size: 12px;
+    padding: 5px 14px; border-radius: 14px; cursor: pointer; z-index: 2;
+    box-shadow: 0 2px 8px rgba(0,0,0,.4);
+  }
+  #newMsgs[hidden] { display: none; }
   #chathead {
     padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--panel);
     display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
@@ -123,6 +157,10 @@
 
 <header>
   <h1>irc<span>mcp</span></h1>
+  <div id="searchWrap">
+    <input id="searchBox" placeholder="search all messages… (enter)" autocomplete="off">
+    <div id="searchResults" hidden></div>
+  </div>
   <div class="status" id="status">connecting…</div>
 </header>
 <main>
@@ -132,6 +170,7 @@
     <form id="create">
       <input id="newName" placeholder="new channel name">
       <input id="newTopic" placeholder="topic (helps agents pick a channel)">
+      <input id="newTags" placeholder="tags, comma separated (k8s, infra)">
       <button type="submit">create</button>
     </form>
   </div>
@@ -140,10 +179,13 @@
       <span class="cname" id="chanName"></span>
       <span class="cid" id="chanId"></span>
       <button id="copyId" type="button">copy id</button>
+      <span id="chanTags" class="tagrow"></span>
+      <button id="editTags" type="button">edit tags</button>
       <span id="chanTopic"></span>
       <span id="members"></span>
     </div>
     <div id="log"><div id="empty">create a channel, or pick one on the left</div></div>
+    <div id="newMsgs" hidden>new messages ↓</div>
     <form id="composer" hidden>
       <input id="nick" title="your nick">
       <input id="msgInput" placeholder="say something…" autocomplete="off">
@@ -158,7 +200,10 @@ let token = null;
 try { token = localStorage.getItem("ircmcp_token"); } catch {}
 let current = null;      // channel id being viewed
 let lastId = 0;          // highest message id rendered
-let es = null;           // EventSource
+let es = null;           // EventSource for the open channel
+let esAll = null;        // EventSource across all channels (unread badges)
+const unread = {};       // channel id -> count of messages seen while not viewing it
+let hiddenCount = 0;     // messages arrived while the tab was hidden (title badge)
 
 const api = (path, opts = {}) =>
   fetch(path, { ...opts, headers: { "x-admin-token": token, "content-type": "application/json", ...(opts.headers || {}) } });
@@ -193,6 +238,12 @@ async function refreshChannels() {
     const name = document.createElement("div");
     name.className = "cname";
     name.textContent = c.name;
+    if (unread[c.id]) {
+      const badge = document.createElement("span");
+      badge.className = "unread";
+      badge.textContent = unread[c.id] > 99 ? "99+" : unread[c.id];
+      name.appendChild(badge);
+    }
     const meta = document.createElement("div");
     meta.className = "cmeta";
     meta.textContent = `${c.member_count} members · ${c.message_count} messages`;
@@ -203,6 +254,17 @@ async function refreshChannels() {
       topic.textContent = c.topic;
       div.appendChild(topic);
     }
+    if (c.tags && c.tags.length) {
+      const row = document.createElement("div");
+      row.className = "tagrow";
+      for (const t of c.tags) {
+        const chip = document.createElement("span");
+        chip.className = "tagchip";
+        chip.textContent = t;
+        row.appendChild(chip);
+      }
+      div.appendChild(row);
+    }
     div.onclick = () => openChannel(c.id);
     box.appendChild(div);
   }
@@ -211,11 +273,12 @@ $("create").addEventListener("submit", async (e) => {
   e.preventDefault();
   const name = $("newName").value.trim();
   if (!name) return;
-  const body = { name, topic: $("newTopic").value.trim() };
+  const body = { name, topic: $("newTopic").value.trim(), tags: $("newTags").value };
   const r = await api("/api/channels", { method: "POST", body: JSON.stringify(body) });
   const c = await r.json();
   $("newName").value = "";
   $("newTopic").value = "";
+  $("newTags").value = "";
   await refreshChannels();
   openChannel(c.id);
 });
@@ -262,12 +325,37 @@ function renderMessage(m) {
   const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
   log.appendChild(div);
   if (atBottom) log.scrollTop = log.scrollHeight;
+  else $("newMsgs").hidden = false; // reader is scrolled up — point at the new arrival
   lastId = Math.max(lastId, m.id);
+}
+
+$("newMsgs").addEventListener("click", () => {
+  $("log").scrollTop = $("log").scrollHeight;
+  $("newMsgs").hidden = true;
+});
+$("log").addEventListener("scroll", () => {
+  const log = $("log");
+  if (log.scrollHeight - log.scrollTop - log.clientHeight < 40) $("newMsgs").hidden = true;
+});
+
+let currentTags = [];
+function renderHeaderTags(tags) {
+  currentTags = tags || [];
+  const box = $("chanTags");
+  box.innerHTML = "";
+  for (const t of tags || []) {
+    const chip = document.createElement("span");
+    chip.className = "tagchip";
+    chip.textContent = t;
+    box.appendChild(chip);
+  }
 }
 
 async function openChannel(id) {
   current = id;
   lastId = 0;
+  delete unread[id];
+  $("newMsgs").hidden = true;
   if (es) { es.close(); es = null; }
   $("log").innerHTML = "";
   const r = await api(`/api/channels/${id}/messages`);
@@ -277,6 +365,7 @@ async function openChannel(id) {
   $("composer").hidden = false;
   $("chanName").textContent = channel.name;
   $("chanTopic").textContent = channel.topic || "";
+  renderHeaderTags(channel.tags);
   $("chanId").textContent = channel.id;
   $("members").textContent = members.length ? "members: " + members.join(", ") : "no members yet";
   for (const m of messages) renderMessage(m);
@@ -289,7 +378,7 @@ async function openChannel(id) {
   es.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.id > lastId) renderMessage(m);
-    if (m.kind === "join") openMembersRefresh();
+    if (m.kind !== "message") openMembersRefresh(); // joins and topic changes touch the header
     $("status").textContent = "live";
   };
   es.onopen = async () => {
@@ -304,9 +393,32 @@ async function openMembersRefresh() {
   if (!current) return;
   const r = await api(`/api/channels/${current}/messages?after=${lastId}`);
   if (!r.ok) return;
-  const { members } = await r.json();
+  const { channel, members } = await r.json();
+  $("chanTopic").textContent = channel.topic || "";
+  renderHeaderTags(channel.tags);
   $("members").textContent = members.length ? "members: " + members.join(", ") : "no members yet";
   refreshChannels();
+}
+
+// ---- new-message indicators ----
+function updateTitle() {
+  document.title = hiddenCount > 0 ? `(${hiddenCount > 99 ? "99+" : hiddenCount}) ircmcp` : "ircmcp";
+}
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) { hiddenCount = 0; updateTitle(); }
+});
+function openFirehose() {
+  if (esAll) esAll.close();
+  esAll = new EventSource(`/api/events?token=${encodeURIComponent(token)}`);
+  esAll.onmessage = (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.kind !== "message") return; // joins/system lines aren't "unread" noise
+    if (document.hidden) { hiddenCount++; updateTitle(); }
+    if (m.channel_id !== current) {
+      unread[m.channel_id] = (unread[m.channel_id] || 0) + 1;
+      refreshChannels();
+    }
+  };
 }
 
 // ---- composer (operator speaking into the channel) ----
@@ -331,6 +443,64 @@ $("composer").addEventListener("submit", async (e) => {
   openMembersRefresh(); // sending implies membership
 });
 
+// ---- free-text search across all channels ----
+$("searchBox").addEventListener("keydown", async (e) => {
+  if (e.key === "Escape") { $("searchResults").hidden = true; return; }
+  if (e.key !== "Enter") return;
+  const text = $("searchBox").value.trim();
+  if (!text) return;
+  const r = await api(`/api/search?text=${encodeURIComponent(text)}`);
+  if (!r.ok) return;
+  const { channels } = await r.json();
+  const box = $("searchResults");
+  box.innerHTML = "";
+  if (!channels.length) {
+    const d = document.createElement("div");
+    d.className = "sr";
+    d.textContent = "no matches";
+    box.appendChild(d);
+  }
+  for (const c of channels) {
+    const d = document.createElement("div");
+    d.className = "sr";
+    const name = document.createElement("div");
+    name.className = "srname";
+    name.textContent = `#${c.name} — ${c.match_count} match${c.match_count === 1 ? "" : "es"}`;
+    d.appendChild(name);
+    for (const m of c.top_matches) {
+      const s = document.createElement("div");
+      s.className = "srsnip";
+      s.textContent = `${m.nick}: ${m.snippet}`;
+      d.appendChild(s);
+    }
+    d.onclick = () => {
+      box.hidden = true;
+      $("searchBox").value = "";
+      openChannel(c.id);
+    };
+    box.appendChild(d);
+  }
+  box.hidden = false;
+});
+document.addEventListener("click", (e) => {
+  if (!$("searchWrap").contains(e.target)) $("searchResults").hidden = true;
+});
+
+$("editTags").addEventListener("click", async () => {
+  if (!current) return;
+  const v = prompt("tags (comma separated):", currentTags.join(", "));
+  if (v === null) return; // cancelled
+  const nick = $("nick").value.trim() || "operator";
+  const r = await api(`/api/channels/${current}/tags`, {
+    method: "PUT",
+    body: JSON.stringify({ tags: v, nick }),
+  });
+  if (r.ok) {
+    renderHeaderTags((await r.json()).tags);
+    refreshChannels();
+  }
+});
+
 $("copyId").addEventListener("click", async () => {
   try {
     await navigator.clipboard.writeText(current);
@@ -344,6 +514,7 @@ $("copyId").addEventListener("click", async () => {
 async function boot() {
   $("status").textContent = "connected";
   await refreshChannels();
+  openFirehose();
   setInterval(refreshChannels, 15000); // keep counts fresh-ish
 }
 

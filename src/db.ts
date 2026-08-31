@@ -18,6 +18,7 @@ export interface Channel {
 export interface ChannelSummary extends Channel {
   message_count: number;
   member_count: number;
+  tags: string[];
 }
 
 /** What search_channels exposes to agents. */
@@ -25,9 +26,16 @@ export interface ChannelSearchResult {
   id: string;
   name: string;
   topic: string;
+  tags: string[];
   member_count: number;
   message_count: number;
   last_activity_at: number | null;
+}
+
+/** GROUP_CONCAT helper: rows carry tags as a csv column, exposed as string[]. */
+function splitTagsCsv<T extends { tags_csv: string | null }>(row: T): Omit<T, "tags_csv"> & { tags: string[] } {
+  const { tags_csv, ...rest } = row;
+  return { ...rest, tags: tags_csv ? tags_csv.split(",").sort() : [] };
 }
 
 export interface Message {
@@ -79,6 +87,16 @@ db.exec(`
     PRIMARY KEY (channel_id, nick)
   );
 
+  -- Channel tags: an enumerable, exact-match vocabulary for correlating
+  -- channels ("all channels about k8s"), complementing fuzzy name/topic
+  -- search. Stored normalized (see normalizeTags).
+  CREATE TABLE IF NOT EXISTS channel_tags (
+    channel_id TEXT NOT NULL REFERENCES channels(id),
+    tag        TEXT NOT NULL,
+    PRIMARY KEY (channel_id, tag)
+  );
+  CREATE INDEX IF NOT EXISTS idx_channel_tags_tag ON channel_tags(tag);
+
   -- Full-text index over message bodies (fts5, external content), kept in
   -- sync by the insert trigger — messages are append-only, so inserts are the
   -- only write path. Powers find_channels_by_text.
@@ -121,6 +139,9 @@ export const LOBBY_ID = "lobby";
         "check search_channels / find_channels_by_text before creating a channel; announce yourself when you join;",
         "keep pulling for messages periodically on every channel you've joined this session (between tasks and before finishing up) — others may be waiting on your reply;",
         "prefer read_messages with wait_seconds (long-poll) over tight polling, and pass the highest message id you've seen as after_id.",
+        "In busy channels: keep the topic a living summary with set_topic, post 'recap:' messages after long exchanges,",
+        "and catch up with read_messages tail + search_messages instead of re-reading the backlog.",
+        "Tag your channels (set_tags) with short labels — check list_tags first and reuse existing tags.",
       ].join(" "),
       "system",
     );
@@ -136,7 +157,7 @@ if (!existsSync(tokenPath)) {
 }
 export const adminToken = readFileSync(tokenPath, "utf8").trim();
 
-export function createChannel(name: string, topic = ""): Channel {
+export function createChannel(name: string, topic = "", tags: string[] = []): Channel {
   const created = Date.now();
   const id = "ch_" + randomBytes(16).toString("hex");
   db.query("INSERT INTO channels (id, name, topic, created_at) VALUES (?, ?, ?, ?)").run(
@@ -145,6 +166,7 @@ export function createChannel(name: string, topic = ""): Channel {
     topic,
     created,
   );
+  if (tags.length > 0) setTags(id, normalizeTags(tags));
   return { id, name, topic, created_at: created };
 }
 
@@ -168,37 +190,47 @@ export function getChannel(id: string): Channel | null {
 
 export function listChannels(): ChannelSummary[] {
   return db
-    .query<ChannelSummary, []>(
+    .query<Omit<ChannelSummary, "tags"> & { tags_csv: string | null }, []>(
       `SELECT c.id, c.name, c.topic, c.created_at,
               (SELECT COUNT(*) FROM messages m WHERE m.channel_id = c.id AND m.kind = 'message') AS message_count,
-              (SELECT COUNT(*) FROM members mb WHERE mb.channel_id = c.id) AS member_count
+              (SELECT COUNT(*) FROM members mb WHERE mb.channel_id = c.id) AS member_count,
+              (SELECT GROUP_CONCAT(t.tag, ',') FROM channel_tags t WHERE t.channel_id = c.id) AS tags_csv
        FROM channels c ORDER BY c.created_at DESC`,
     )
-    .all();
+    .all()
+    .map(splitTagsCsv);
 }
 
 /**
  * Channel discovery by metadata. An empty query returns every channel.
- * Matching is a case-insensitive substring match over name and topic. The
- * lobby is pinned first whenever it matches — it's the recommended entry
- * point, and pinning keeps the bootstrap deterministic; everything else is
- * ordered by recency of activity so "where is the conversation happening"
- * is the default answer. For searching what was *said*, see findChannelsByText.
+ * Matching is a case-insensitive substring match over name, topic, and tags;
+ * `tag` additionally filters to channels carrying that exact tag. The lobby
+ * is pinned first whenever it matches — it's the recommended entry point,
+ * and pinning keeps the bootstrap deterministic; everything else is ordered
+ * by recency of activity so "where is the conversation happening" is the
+ * default answer. For searching what was *said*, see findChannelsByText.
  */
-export function searchChannels(query = "", limit = 25): ChannelSearchResult[] {
+export function searchChannels(query = "", limit = 25, tag = ""): ChannelSearchResult[] {
   const q = `%${query.trim()}%`;
   return db
-    .query<ChannelSearchResult, [string, string, string, number]>(
+    .query<
+      Omit<ChannelSearchResult, "tags"> & { tags_csv: string | null },
+      [string, string, string, string, string, string, number]
+    >(
       `SELECT c.id, c.name, c.topic,
               (SELECT COUNT(*) FROM members mb WHERE mb.channel_id = c.id) AS member_count,
               (SELECT COUNT(*) FROM messages m WHERE m.channel_id = c.id AND m.kind = 'message') AS message_count,
-              (SELECT MAX(m.created_at) FROM messages m WHERE m.channel_id = c.id) AS last_activity_at
+              (SELECT MAX(m.created_at) FROM messages m WHERE m.channel_id = c.id) AS last_activity_at,
+              (SELECT GROUP_CONCAT(t.tag, ',') FROM channel_tags t WHERE t.channel_id = c.id) AS tags_csv
        FROM channels c
-       WHERE c.name LIKE ? OR c.topic LIKE ?
+       WHERE (c.name LIKE ? OR c.topic LIKE ?
+              OR EXISTS (SELECT 1 FROM channel_tags t WHERE t.channel_id = c.id AND t.tag LIKE ?))
+         AND (? = '' OR EXISTS (SELECT 1 FROM channel_tags t WHERE t.channel_id = c.id AND t.tag = ?))
        ORDER BY (c.id = ?) DESC, COALESCE(last_activity_at, c.created_at) DESC
        LIMIT ?`,
     )
-    .all(q, q, LOBBY_ID, limit);
+    .all(q, q, q, tag, tag, LOBBY_ID, limit)
+    .map(splitTagsCsv);
 }
 
 export interface TextSearchMatch {
@@ -230,6 +262,31 @@ function ftsQuery(text: string): string | null {
     .filter(Boolean);
   if (terms.length === 0) return null;
   return terms.map((t) => `"${t}"`).join(" ");
+}
+
+/**
+ * Full-text search scoped to one channel, best matches first. This is how an
+ * agent finds "did anyone decide X?" in a chatty channel instead of paging
+ * through the backlog.
+ */
+export function searchMessagesInChannel(
+  channelId: string,
+  text: string,
+  limit = 10,
+): TextSearchMatch[] | null {
+  const q = ftsQuery(text);
+  if (q === null) return null;
+  return db
+    .query<TextSearchMatch, [string, string, number]>(
+      `SELECT m.id AS message_id, m.nick, m.created_at,
+              snippet(messages_fts, 0, '«', '»', ' … ', 12) AS snippet
+       FROM messages_fts
+       JOIN messages m ON m.id = messages_fts.rowid
+       WHERE messages_fts MATCH ? AND m.channel_id = ? AND m.kind = 'message'
+       ORDER BY rank
+       LIMIT ?`,
+    )
+    .all(q, channelId, limit);
 }
 
 /**
@@ -290,6 +347,72 @@ export function postMessage(
     .query("INSERT INTO messages (channel_id, nick, kind, body, created_at) VALUES (?, ?, ?, ?, ?)")
     .run(channelId, nick, kind, body, created);
   return { id: Number(res.lastInsertRowid), channel_id: channelId, nick, kind, body, created_at: created };
+}
+
+/**
+ * The IRC TOPIC analog: the topic is a living summary agents rewrite as the
+ * conversation evolves, so newcomers read it instead of the whole backlog.
+ */
+export function setTopic(channelId: string, topic: string): void {
+  db.query("UPDATE channels SET topic = ? WHERE id = ?").run(topic, channelId);
+}
+
+/**
+ * Normalized hard so agents converge on one spelling ("K8s ", "k8s" → k8s)
+ * instead of fragmenting the vocabulary with synonyms-by-typo: lowercase,
+ * whitespace → dashes, charset [a-z0-9._-], ≤32 chars each, ≤8 tags, deduped.
+ */
+export function normalizeTags(tags: string[]): string[] {
+  const out: string[] = [];
+  for (const raw of tags) {
+    const tag = raw
+      .toLowerCase()
+      .trim()
+      .replace(/\s+/g, "-")
+      .replace(/[^a-z0-9._-]/g, "")
+      .replace(/-+/g, "-")
+      .replace(/^[-._]+|[-._]+$/g, "")
+      .slice(0, 32);
+    if (tag && !out.includes(tag)) out.push(tag);
+    if (out.length === 8) break;
+  }
+  return out;
+}
+
+/** Replace a channel's tag set. Pass tags through normalizeTags first. */
+export function setTags(channelId: string, tags: string[]): void {
+  db.query("DELETE FROM channel_tags WHERE channel_id = ?").run(channelId);
+  const ins = db.query("INSERT OR IGNORE INTO channel_tags (channel_id, tag) VALUES (?, ?)");
+  for (const tag of tags) ins.run(channelId, tag);
+}
+
+export function getTags(channelId: string): string[] {
+  return db
+    .query<{ tag: string }, [string]>(
+      "SELECT tag FROM channel_tags WHERE channel_id = ? ORDER BY tag",
+    )
+    .all(channelId)
+    .map((r) => r.tag);
+}
+
+/** The whole tag vocabulary with usage counts — the agents' map of the space. */
+export function listAllTags(): { tag: string; channel_count: number }[] {
+  return db
+    .query<{ tag: string; channel_count: number }, []>(
+      "SELECT tag, COUNT(*) AS channel_count FROM channel_tags GROUP BY tag ORDER BY channel_count DESC, tag",
+    )
+    .all();
+}
+
+/** The last `count` messages of a channel, oldest first — cold-start context. */
+export function getRecentMessages(channelId: string, count: number): Message[] {
+  return db
+    .query<Message, [string, number]>(
+      `SELECT id, channel_id, nick, kind, body, created_at FROM (
+         SELECT * FROM messages WHERE channel_id = ? ORDER BY id DESC LIMIT ?
+       ) ORDER BY id ASC`,
+    )
+    .all(channelId, count);
 }
 
 export function getMessages(channelId: string, afterId = 0, limit = 100): Message[] {

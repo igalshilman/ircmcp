@@ -12,14 +12,18 @@ import { announceNewChannel, buildMcpServer } from "./mcp";
 import {
   adminToken,
   createChannel,
+  findChannelsByText,
   getChannel,
+  getTags,
   joinChannel,
   listChannels,
   listMembers,
   getMessages,
+  normalizeTags,
   postMessage,
+  setTags,
 } from "./db";
-import { publish, subscribe } from "./bus";
+import { publish, subscribe, subscribeAll } from "./bus";
 
 const projectRoot = path.resolve(import.meta.dir, "..");
 
@@ -88,9 +92,34 @@ export function buildApp(): express.Express {
       return;
     }
     const topic = typeof req.body?.topic === "string" ? req.body.topic.trim() : "";
-    const channel = createChannel(name, topic);
-    announceNewChannel("operator", channel);
-    res.status(201).json(channel);
+    // tags arrive as an array, or comma-separated from the webview's text input
+    const rawTags = Array.isArray(req.body?.tags)
+      ? req.body.tags.filter((t: unknown): t is string => typeof t === "string")
+      : typeof req.body?.tags === "string"
+        ? req.body.tags.split(",")
+        : [];
+    const tags = normalizeTags(rawTags);
+    const channel = createChannel(name, topic, tags);
+    announceNewChannel("operator", channel, tags);
+    res.status(201).json({ ...channel, tags });
+  });
+
+  // Free-text search for the operator — same FTS the agents use, grouped by
+  // channel with snippets.
+  app.get("/api/search", requireAdmin, (req, res) => {
+    const text = typeof req.query.text === "string" ? req.query.text : "";
+    let results;
+    try {
+      results = findChannelsByText(text, 15);
+    } catch {
+      res.status(400).json({ error: "bad search text" });
+      return;
+    }
+    if (results === null) {
+      res.status(400).json({ error: "text required" });
+      return;
+    }
+    res.json({ channels: results });
   });
 
   app.get("/api/channels/:id/messages", requireAdmin, (req: Request<{ id: string }>, res) => {
@@ -101,10 +130,38 @@ export function buildApp(): express.Express {
     }
     const afterId = Number(req.query.after ?? 0) || 0;
     res.json({
-      channel,
+      channel: { ...channel, tags: getTags(channel.id) },
       members: listMembers(channel.id).map((m) => m.nick),
       messages: getMessages(channel.id, afterId, 1000),
     });
+  });
+
+  // The operator retagging a channel from the webview — same semantics and
+  // in-channel announcement as the agents' set_tags tool.
+  app.put("/api/channels/:id/tags", requireAdmin, (req: Request<{ id: string }>, res) => {
+    const channel = getChannel(req.params.id);
+    if (!channel) {
+      res.status(404).json({ error: "unknown channel" });
+      return;
+    }
+    const rawTags = Array.isArray(req.body?.tags)
+      ? req.body.tags.filter((t: unknown): t is string => typeof t === "string")
+      : typeof req.body?.tags === "string"
+        ? req.body.tags.split(",")
+        : [];
+    const tags = normalizeTags(rawTags);
+    const rawNick = typeof req.body?.nick === "string" ? req.body.nick.trim() : "";
+    const nick = rawNick || "operator";
+    setTags(channel.id, tags);
+    publish(
+      postMessage(
+        channel.id,
+        nick,
+        tags.length ? `${nick} set tags to: ${tags.join(", ")}` : `${nick} cleared the tags`,
+        "system",
+      ),
+    );
+    res.json({ tags });
   });
 
   // The operator speaking from the webview. Goes through the same
@@ -127,6 +184,25 @@ export function buildApp(): express.Express {
     const msg = postMessage(channel.id, nick, message);
     publish(msg);
     res.status(201).json(msg);
+  });
+
+  // Firehose across all channels — the webview uses it for unread badges on
+  // channels other than the one being viewed.
+  app.get("/api/events", requireAdmin, (req, res) => {
+    res.writeHead(200, {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    });
+    res.write(": connected\n\n");
+    const unsub = subscribeAll((msg) => {
+      res.write(`data: ${JSON.stringify(msg)}\n\n`);
+    });
+    const ping = setInterval(() => res.write(": ping\n\n"), 25000);
+    req.on("close", () => {
+      clearInterval(ping);
+      unsub();
+    });
   });
 
   app.get("/api/channels/:id/events", requireAdmin, (req: Request<{ id: string }>, res) => {

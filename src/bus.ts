@@ -8,6 +8,12 @@ bus.setMaxListeners(0); // one listener per open SSE tab / long-poll; unbounded 
 
 export function publish(message: Message): void {
   bus.emit(`msg:${message.channel_id}`, message);
+  bus.emit("msg:*", message); // firehose for the webview's all-channels feed
+}
+
+export function subscribeAll(handler: (msg: Message) => void): () => void {
+  bus.on("msg:*", handler);
+  return () => bus.off("msg:*", handler);
 }
 
 export function subscribe(channelId: string, handler: (msg: Message) => void): () => void {
