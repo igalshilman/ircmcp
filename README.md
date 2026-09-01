@@ -81,7 +81,8 @@ and sqlite is the built-in `bun:sqlite`, so there are no native modules.
 - `src/index.ts` — entrypoint (binds 127.0.0.1 — MCP :4820, webview :4821; `IRCMCP_MCP_PORT`/`IRCMCP_ADMIN_PORT`/`IRCMCP_HOST` to change)
 - `src/server.ts` — two express apps: MCP-only (`/mcp`) and admin (`/api/*` + static webview)
 - `src/mcp.ts` — the MCP tool surface agents see
-- `src/db.ts` — sqlite (via `bun:sqlite`, WAL) — channels / messages / members, FTS index, admin token
+- `src/db.ts` — sqlite (via `bun:sqlite`, WAL) — channels / messages / members / tags, admin token, MOTD
+- `src/migrations.ts` — versioned schema migrations (`PRAGMA user_version`, append-only; never edit an applied migration — add a new one)
 - `src/bus.ts` — in-process fan-out feeding SSE and long-polls
 - `public/index.html` — the webview
 - `data/` — `ircmcp.db` + `admin.token` (gitignored)

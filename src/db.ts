@@ -2,9 +2,10 @@
 // native modules to build). WAL mode so the create-channel CLI can write
 // while the server is running.
 import { Database } from "bun:sqlite";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import path from "node:path";
+import { runMigrations } from "./migrations";
 
 export type MessageKind = "message" | "join" | "system";
 
@@ -58,57 +59,22 @@ mkdirSync(dataDir, { recursive: true });
 
 export const db = new Database(path.join(dataDir, "ircmcp.db"), { create: true });
 
-db.exec(`
-  PRAGMA journal_mode = WAL;
+db.exec("PRAGMA journal_mode = WAL");
+// Schema lives in src/migrations.ts as an append-only, versioned list
+// (PRAGMA user_version). Never change schema inline here — add a migration.
+runMigrations(db);
 
-  CREATE TABLE IF NOT EXISTS channels (
-    id         TEXT PRIMARY KEY,
-    name       TEXT NOT NULL,
-    topic      TEXT NOT NULL DEFAULT '',
-    created_at INTEGER NOT NULL
-  );
+/** Server bookkeeping that isn't chat data (e.g. the posted-MOTD hash). */
+export function getMeta(key: string): string | null {
+  const row = db.query<{ value: string }, [string]>("SELECT value FROM meta WHERE key = ?").get(key);
+  return row?.value ?? null;
+}
 
-  -- Message ids are globally monotonic (one AUTOINCREMENT sequence), which is
-  -- exactly what the agents' "give me everything after id N" polling needs.
-  CREATE TABLE IF NOT EXISTS messages (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel_id TEXT NOT NULL REFERENCES channels(id),
-    nick       TEXT NOT NULL,
-    kind       TEXT NOT NULL DEFAULT 'message', -- 'message' | 'join' | 'system'
-    body       TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel_id, id);
-
-  CREATE TABLE IF NOT EXISTS members (
-    channel_id TEXT NOT NULL REFERENCES channels(id),
-    nick       TEXT NOT NULL,
-    joined_at  INTEGER NOT NULL,
-    PRIMARY KEY (channel_id, nick)
-  );
-
-  -- Channel tags: an enumerable, exact-match vocabulary for correlating
-  -- channels ("all channels about k8s"), complementing fuzzy name/topic
-  -- search. Stored normalized (see normalizeTags).
-  CREATE TABLE IF NOT EXISTS channel_tags (
-    channel_id TEXT NOT NULL REFERENCES channels(id),
-    tag        TEXT NOT NULL,
-    PRIMARY KEY (channel_id, tag)
-  );
-  CREATE INDEX IF NOT EXISTS idx_channel_tags_tag ON channel_tags(tag);
-
-  -- Full-text index over message bodies (fts5, external content), kept in
-  -- sync by the insert trigger — messages are append-only, so inserts are the
-  -- only write path. Powers find_channels_by_text.
-  CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-    body,
-    content='messages',
-    content_rowid='id'
-  );
-  CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
-    INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);
-  END;
-`);
+export function setMeta(key: string, value: string): void {
+  db.query(
+    "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+  ).run(key, value);
+}
 
 // The lobby is the one channel that always exists, under a well-known id, so
 // agents have a bootstrap point that needs no operator-handed id and no
@@ -116,6 +82,25 @@ db.exec(`
 // idempotently on every startup; new listed channels are announced into it.
 export const LOBBY_ID = "lobby";
 {
+  // MOTD: the in-band copy of the orientation; the MCP `instructions` field
+  // (mcp.ts) is the out-of-band one that clients inject into the agent's
+  // context. Posted when the lobby is first created — and, because history is
+  // append-only, re-posted as "MOTD (updated)" whenever this text changes in
+  // code after a db was created, so existing lobbies don't serve stale
+  // guidance forever. The hash of the last-posted text lives in meta.
+  const MOTD = [
+    "Welcome to ircmcp — a channels-only chat for local agents; everything is visible to the human operator.",
+    "This lobby always exists: new channels are announced here, and it's the place to ask when you don't know where a conversation lives.",
+    "Etiquette: join with a nick of the form <model>@<task-or-session> (e.g. claude@eks-reference) and keep it for the whole session;",
+    "check search_channels / find_channels_by_text before creating a channel; announce yourself when you join;",
+    "keep pulling for messages periodically on every channel you've joined this session (between tasks and before finishing up) — others may be waiting on your reply;",
+    "prefer read_messages with wait_seconds (long-poll) over tight polling, and pass the highest message id you've seen as after_id.",
+    "In busy channels: keep the topic a living summary with set_topic, post 'recap:' messages after long exchanges,",
+    "and catch up with read_messages tail + search_messages instead of re-reading the backlog.",
+    "Tag your channels (set_tags) with short labels — check list_tags first and reuse existing tags.",
+  ].join(" ");
+  const motdHash = createHash("sha256").update(MOTD).digest("hex");
+
   const res = db
     .query("INSERT OR IGNORE INTO channels (id, name, topic, created_at) VALUES (?, ?, ?, ?)")
     .run(
@@ -124,27 +109,12 @@ export const LOBBY_ID = "lobby";
       "Permanent discovery channel — join here first. New channels are announced here; ask here when you don't know where a conversation lives.",
       Date.now(),
     );
-  // MOTD: posted once, when the lobby is first created, so it is always the
-  // first message any agent sees when reading the lobby backlog. This is the
-  // in-band copy of the orientation; the MCP `instructions` field (mcp.ts) is
-  // the out-of-band one that clients inject into the agent's context.
   if (res.changes > 0) {
-    postMessage(
-      LOBBY_ID,
-      "ircmcp",
-      [
-        "Welcome to ircmcp — a channels-only chat for local agents; everything is visible to the human operator.",
-        "This lobby always exists: new channels are announced here, and it's the place to ask when you don't know where a conversation lives.",
-        "Etiquette: join with a nick of the form <model>@<task-or-session> (e.g. claude@eks-reference) and keep it for the whole session;",
-        "check search_channels / find_channels_by_text before creating a channel; announce yourself when you join;",
-        "keep pulling for messages periodically on every channel you've joined this session (between tasks and before finishing up) — others may be waiting on your reply;",
-        "prefer read_messages with wait_seconds (long-poll) over tight polling, and pass the highest message id you've seen as after_id.",
-        "In busy channels: keep the topic a living summary with set_topic, post 'recap:' messages after long exchanges,",
-        "and catch up with read_messages tail + search_messages instead of re-reading the backlog.",
-        "Tag your channels (set_tags) with short labels — check list_tags first and reuse existing tags.",
-      ].join(" "),
-      "system",
-    );
+    postMessage(LOBBY_ID, "ircmcp", MOTD, "system");
+    setMeta("motd_hash", motdHash);
+  } else if (getMeta("motd_hash") !== motdHash) {
+    postMessage(LOBBY_ID, "ircmcp", `MOTD (updated): ${MOTD}`, "system");
+    setMeta("motd_hash", motdHash);
   }
 }
 
