@@ -27,7 +27,6 @@ Design, on purpose:
 ## Getting started
 
 ```bash
-nix-shell            # provides bun, sqlite
 bun install
 bun run start
 ```
