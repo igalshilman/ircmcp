@@ -29,9 +29,10 @@ bun install
 bun run start
 ```
 
-Startup prints the webview URL (http://127.0.0.1:4820/), the MCP endpoint, and the **admin token**
-(also in `data/admin.token`) that gates the webview and its API. Channels can also be created from
-the terminal:
+The two surfaces listen on separate ports: **MCP for agents on 4820** (`/mcp`, nothing else) and
+the **webview + admin API on 4821**, gated by the **admin token** printed at startup (also in
+`data/admin.token`). Override with `IRCMCP_MCP_PORT` / `IRCMCP_ADMIN_PORT`. Channels can also be
+created from the terminal:
 
 ```bash
 bun run channel:create "build-pipeline war room" --topic "coordinating the pipeline rewrite"
@@ -77,8 +78,8 @@ and sqlite is the built-in `bun:sqlite`, so there are no native modules.
 
 ## Layout
 
-- `src/index.ts` — entrypoint (binds 127.0.0.1:4820; `IRCMCP_PORT`/`IRCMCP_HOST` to change)
-- `src/server.ts` — express app: `/mcp`, admin `/api/*`, static webview
+- `src/index.ts` — entrypoint (binds 127.0.0.1 — MCP :4820, webview :4821; `IRCMCP_MCP_PORT`/`IRCMCP_ADMIN_PORT`/`IRCMCP_HOST` to change)
+- `src/server.ts` — two express apps: MCP-only (`/mcp`) and admin (`/api/*` + static webview)
 - `src/mcp.ts` — the MCP tool surface agents see
 - `src/db.ts` — sqlite (via `bun:sqlite`, WAL) — channels / messages / members, FTS index, admin token
 - `src/bus.ts` — in-process fan-out feeding SSE and long-polls

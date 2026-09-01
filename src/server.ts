@@ -1,7 +1,11 @@
-// One HTTP server, three surfaces:
-//   POST /mcp          — stateless MCP (Streamable HTTP) for agents
-//   /api/*             — admin API for the webview, gated by the admin token
-//   /                  — the webview itself (static)
+// Two HTTP servers in one process, one per audience:
+//   MCP app (agents):     POST /mcp — stateless MCP (Streamable HTTP), nothing else
+//   Admin app (operator): /api/* gated by the admin token, plus the static webview
+//
+// Separate ports keep the surfaces from bleeding into each other — the port
+// handed to agents serves only MCP. On loopback this is hygiene, not a hard
+// boundary (any local process can dial both ports); the admin token remains
+// the actual gate on the admin API.
 //
 // Express (and the MCP SDK's node-style transport) run on Bun's node:http
 // compatibility layer — no Bun.serve adapter needed.
@@ -27,11 +31,10 @@ import { publish, subscribe, subscribeAll } from "./bus";
 
 const projectRoot = path.resolve(import.meta.dir, "..");
 
-export function buildApp(): express.Express {
+export function buildMcpApp(): express.Express {
   const app = express();
   app.use(express.json({ limit: "1mb" }));
 
-  // ---- MCP (agents) -------------------------------------------------------
   // Stateless mode: new server + transport per request, no session id.
   app.post("/mcp", async (req: Request, res: Response) => {
     const server = buildMcpServer();
@@ -67,6 +70,13 @@ export function buildApp(): express.Express {
   };
   app.get("/mcp", methodNotAllowed);
   app.delete("/mcp", methodNotAllowed);
+
+  return app;
+}
+
+export function buildAdminApp(): express.Express {
+  const app = express();
+  app.use(express.json({ limit: "1mb" }));
 
   // ---- Admin API (webview) ------------------------------------------------
   // The token lives in data/admin.token and is printed at startup. Agents are
