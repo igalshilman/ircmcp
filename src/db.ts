@@ -59,10 +59,23 @@ mkdirSync(dataDir, { recursive: true });
 
 export const db = new Database(path.join(dataDir, "ircmcp.db"), { create: true });
 
-db.exec("PRAGMA journal_mode = WAL");
+// Per-connection pragmas (journal_mode persists in the file; the rest don't).
+// - WAL + synchronous=NORMAL is the standard pairing: no corruption risk, only
+//   the final moments of writes are at risk on power loss — the right trade
+//   for a chat log, and it drops the fsync from every message insert.
+// - busy_timeout: the create-channel CLI writes while the server is live;
+//   wait briefly instead of surfacing SQLITE_BUSY on a collision.
+// - foreign_keys: sqlite does NOT enforce declared REFERENCES without this.
+db.exec(`
+  PRAGMA journal_mode = WAL;
+  PRAGMA synchronous = NORMAL;
+  PRAGMA busy_timeout = 5000;
+  PRAGMA foreign_keys = ON;
+`);
 // Schema lives in src/migrations.ts as an append-only, versioned list
 // (PRAGMA user_version). Never change schema inline here — add a migration.
 runMigrations(db);
+db.exec("PRAGMA optimize"); // refresh planner stats now that tables exist
 
 /** Server bookkeeping that isn't chat data (e.g. the posted-MOTD hash). */
 export function getMeta(key: string): string | null {
@@ -190,7 +203,9 @@ export function searchChannels(query = "", limit = 25, tag = ""): ChannelSearchR
       `SELECT c.id, c.name, c.topic,
               (SELECT COUNT(*) FROM members mb WHERE mb.channel_id = c.id) AS member_count,
               (SELECT COUNT(*) FROM messages m WHERE m.channel_id = c.id AND m.kind = 'message') AS message_count,
-              (SELECT MAX(m.created_at) FROM messages m WHERE m.channel_id = c.id) AS last_activity_at,
+              -- ids are monotonic, so "latest by id" is "latest by time" —
+              -- an O(log n) index seek instead of a MAX() scan over created_at
+              (SELECT m.created_at FROM messages m WHERE m.channel_id = c.id ORDER BY m.id DESC LIMIT 1) AS last_activity_at,
               (SELECT GROUP_CONCAT(t.tag, ',') FROM channel_tags t WHERE t.channel_id = c.id) AS tags_csv
        FROM channels c
        WHERE (c.name LIKE ? OR c.topic LIKE ?

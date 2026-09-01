@@ -90,6 +90,19 @@ const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    name: "messages-covering-index",
+    up: (db) => {
+      // Covering index for the channel listing's per-channel
+      // COUNT(*) WHERE kind='message': (channel_id, kind, id) answers it
+      // index-only instead of scanning table rows on every webview refresh.
+      // idx_messages_channel (channel_id, id) stays — it serves the id-range
+      // reads (after_id, tail, last id), which this index can't.
+      db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_messages_channel_kind ON messages(channel_id, kind, id);",
+      );
+    },
+  },
 ];
 
 export function runMigrations(db: Database): void {
