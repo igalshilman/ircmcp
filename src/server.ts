@@ -16,6 +16,7 @@ import { announceNewChannel, buildMcpServer } from "./mcp";
 import {
   adminToken,
   createChannel,
+  deleteChannel,
   findChannelsByText,
   getChannel,
   getTags,
@@ -27,7 +28,14 @@ import {
   postMessage,
   setTags,
 } from "./db";
-import { publish, subscribe, subscribeAll } from "./bus";
+import {
+  publish,
+  publishChannelDeleted,
+  subscribe,
+  subscribeAll,
+  subscribeAllDeleted,
+  subscribeDeleted,
+} from "./bus";
 
 const projectRoot = path.resolve(import.meta.dir, "..");
 
@@ -146,6 +154,29 @@ export function buildAdminApp(): express.Express {
     });
   });
 
+  // Batch channel deletion — operator only, there is deliberately no MCP tool
+  // for this. Purges the channel and all its content; the lobby is refused.
+  app.post("/api/channels/delete", requireAdmin, (req, res) => {
+    const ids = Array.isArray(req.body?.ids)
+      ? req.body.ids.filter((x: unknown): x is string => typeof x === "string")
+      : [];
+    if (ids.length === 0) {
+      res.status(400).json({ error: "ids required" });
+      return;
+    }
+    const deleted: string[] = [];
+    const skipped: string[] = [];
+    for (const id of ids) {
+      if (deleteChannel(id)) {
+        publishChannelDeleted(id); // kick blocked long-polls + SSE streams
+        deleted.push(id);
+      } else {
+        skipped.push(id); // unknown, or the lobby
+      }
+    }
+    res.json({ deleted, skipped });
+  });
+
   // The operator retagging a channel from the webview — same semantics and
   // in-channel announcement as the agents' set_tags tool.
   app.put("/api/channels/:id/tags", requireAdmin, (req: Request<{ id: string }>, res) => {
@@ -208,10 +239,14 @@ export function buildAdminApp(): express.Express {
     const unsub = subscribeAll((msg) => {
       res.write(`data: ${JSON.stringify(msg)}\n\n`);
     });
+    const unsubDel = subscribeAllDeleted((channelId) => {
+      res.write(`data: ${JSON.stringify({ kind: "channel_deleted", channel_id: channelId })}\n\n`);
+    });
     const ping = setInterval(() => res.write(": ping\n\n"), 25000);
     req.on("close", () => {
       clearInterval(ping);
       unsub();
+      unsubDel();
     });
   });
 
@@ -230,10 +265,16 @@ export function buildAdminApp(): express.Express {
     const unsub = subscribe(channel.id, (msg) => {
       res.write(`data: ${JSON.stringify(msg)}\n\n`);
     });
+    const unsubDel = subscribeDeleted(channel.id, () => {
+      // typed SSE event so the webview can distinguish "deleted" from data
+      res.write(`event: deleted\ndata: {"channel_id":"${channel.id}"}\n\n`);
+      res.end();
+    });
     const ping = setInterval(() => res.write(": ping\n\n"), 25000);
     req.on("close", () => {
       clearInterval(ping);
       unsub();
+      unsubDel();
     });
   });
 

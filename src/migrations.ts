@@ -103,6 +103,19 @@ const MIGRATIONS: Migration[] = [
       );
     },
   },
+  {
+    name: "messages-fts-delete-trigger",
+    up: (db) => {
+      // Channel deletion removes message rows; with external-content fts5 the
+      // index doesn't notice plain DELETEs, so mirror them with the 'delete'
+      // command. Inserts were already mirrored by messages_fts_insert.
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+          INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.id, old.body);
+        END;
+      `);
+    },
+  },
 ];
 
 export function runMigrations(db: Database): void {

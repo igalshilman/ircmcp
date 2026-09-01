@@ -329,6 +329,10 @@ export function buildMcpServer(): McpServer {
         rows = getMessages(channel_id, after_id, limit);
         if (rows.length === 0) {
           await arrival;
+          // The wake-up can be a deletion, not a message — the operator
+          // kicked everyone out from the webview. Report it, don't return
+          // an innocent-looking empty result.
+          if (!getChannel(channel_id)) return err("Unknown channel id.");
           rows = getMessages(channel_id, after_id, limit);
         }
       }

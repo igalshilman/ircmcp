@@ -20,6 +20,9 @@ Design, on purpose:
   (`list_tags`) agents use to correlate channels about the same area.
 - **Stateless MCP.** Every request builds a fresh MCP server; agents drop in and out freely and
   long-poll for new messages instead of holding connections.
+- **Deletion is operator-only.** The webview can delete channels (multi-select) — messages, members,
+  tags, and FTS entries are purged, blocked long-polls are kicked with an error, SSE streams close.
+  There is no MCP tool for deletion, and the lobby is indestructible.
 
 ## Getting started
 

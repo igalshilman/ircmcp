@@ -57,7 +57,19 @@
   #channels { flex: 1; overflow-y: auto; }
   .chan {
     padding: 8px 14px; cursor: pointer; border-left: 3px solid transparent;
+    display: flex; gap: 8px; align-items: flex-start;
   }
+  .chan .cbody { flex: 1; min-width: 0; }
+  .chan input[type="checkbox"] {
+    flex: none; width: auto; margin: 3px 0 0; padding: 0;
+    accent-color: var(--accent);
+  }
+  #deleteBar { padding: 10px 14px 0; }
+  #deleteBar[hidden] { display: none; }
+  #deleteBtn {
+    width: 100%; border-color: #e07b7b; color: #e07b7b;
+  }
+  #deleteBtn:hover { background: rgba(224, 123, 123, .12); border-color: #e07b7b; color: #e07b7b; }
   .chan:hover { background: var(--panel2); }
   .chan.active { background: var(--accent2); border-left-color: var(--accent); }
   .chan .cname { color: var(--text); }
@@ -175,6 +187,9 @@
   <div id="sidebar">
     <div class="section-title">channels</div>
     <div id="channels"></div>
+    <div id="deleteBar" hidden>
+      <button id="deleteBtn" type="button">delete selected</button>
+    </div>
     <form id="create">
       <input id="newName" placeholder="new channel name">
       <input id="newTopic" placeholder="topic (helps agents pick a channel)">
@@ -235,14 +250,40 @@ $("gateForm").addEventListener("submit", async (e) => {
 });
 
 // ---- channels sidebar ----
+const selected = new Set(); // channel ids checked for deletion
+
+function updateDeleteBar() {
+  $("deleteBar").hidden = selected.size === 0;
+  $("deleteBtn").textContent = `delete selected (${selected.size})`;
+}
+
 async function refreshChannels() {
   const r = await api("/api/channels");
   const { channels } = await r.json();
+  // prune selections pointing at channels that no longer exist
+  for (const id of [...selected]) if (!channels.some((c) => c.id === id)) selected.delete(id);
+  updateDeleteBar();
   const box = $("channels");
   box.innerHTML = "";
   for (const c of channels) {
     const div = document.createElement("div");
     div.className = "chan" + (c.id === current ? " active" : "");
+    if (c.id !== "lobby") { // the lobby is indestructible — no checkbox
+      const check = document.createElement("input");
+      check.type = "checkbox";
+      check.checked = selected.has(c.id);
+      check.title = "select for deletion";
+      check.onclick = (ev) => {
+        ev.stopPropagation();
+        if (check.checked) selected.add(c.id);
+        else selected.delete(c.id);
+        updateDeleteBar();
+      };
+      div.appendChild(check);
+    }
+    const body = document.createElement("div");
+    body.className = "cbody";
+    div.appendChild(body);
     const name = document.createElement("div");
     name.className = "cname";
     name.textContent = c.name;
@@ -255,12 +296,12 @@ async function refreshChannels() {
     const meta = document.createElement("div");
     meta.className = "cmeta";
     meta.textContent = `${c.member_count} members · ${c.message_count} messages`;
-    div.append(name, meta);
+    body.append(name, meta);
     if (c.topic) {
       const topic = document.createElement("div");
       topic.className = "ctopic";
       topic.textContent = c.topic;
-      div.appendChild(topic);
+      body.appendChild(topic);
     }
     if (c.tags && c.tags.length) {
       const row = document.createElement("div");
@@ -271,7 +312,7 @@ async function refreshChannels() {
         chip.textContent = t;
         row.appendChild(chip);
       }
-      div.appendChild(row);
+      body.appendChild(row);
     }
     div.onclick = () => openChannel(c.id);
     box.appendChild(div);
@@ -347,6 +388,38 @@ $("log").addEventListener("scroll", () => {
   if (log.scrollHeight - log.scrollTop - log.clientHeight < 40) $("newMsgs").hidden = true;
 });
 
+function resetChannelView(notice) {
+  current = null;
+  lastId = 0;
+  if (es) { es.close(); es = null; }
+  $("chathead").hidden = true;
+  $("composer").hidden = true;
+  $("newMsgs").hidden = true;
+  const log = $("log");
+  log.innerHTML = "";
+  const d = document.createElement("div");
+  d.id = "empty";
+  d.textContent = notice || "create a channel, or pick one on the left";
+  log.appendChild(d);
+}
+
+$("deleteBtn").addEventListener("click", async () => {
+  const ids = [...selected];
+  if (!ids.length) return;
+  const label = ids.length === 1 ? "this channel" : `these ${ids.length} channels`;
+  if (!confirm(`Delete ${label} and all their messages? Connected agents get kicked out. This cannot be undone.`)) return;
+  const r = await api("/api/channels/delete", { method: "POST", body: JSON.stringify({ ids }) });
+  if (!r.ok) return;
+  const { deleted } = await r.json();
+  for (const id of deleted) {
+    selected.delete(id);
+    delete unread[id];
+    if (id === current) resetChannelView("channel deleted");
+  }
+  updateDeleteBar();
+  refreshChannels();
+});
+
 let currentTags = [];
 function renderHeaderTags(tags) {
   currentTags = tags || [];
@@ -402,6 +475,12 @@ async function openChannel(id, focusId) {
     const rr = await api(`/api/channels/${id}/messages?after=${lastId}`);
     if (rr.ok && current === id) for (const m of (await rr.json()).messages) renderMessage(m);
   };
+  es.addEventListener("deleted", () => {
+    // the operator deleted the channel we're looking at (from another tab
+    // or this one — resetChannelView is idempotent)
+    resetChannelView("this channel was deleted");
+    refreshChannels();
+  });
   es.onerror = () => { $("status").textContent = "reconnecting…"; };
 }
 
@@ -428,6 +507,14 @@ function openFirehose() {
   esAll = new EventSource(`/api/events?token=${encodeURIComponent(token)}`);
   esAll.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
+    if (m.kind === "channel_deleted") {
+      delete unread[m.channel_id];
+      selected.delete(m.channel_id);
+      if (m.channel_id === current) resetChannelView("this channel was deleted");
+      updateDeleteBar();
+      refreshChannels();
+      return;
+    }
     if (m.kind !== "message") return; // joins/system lines aren't "unread" noise
     if (document.hidden) { hiddenCount++; updateTitle(); }
     if (m.channel_id !== current) {

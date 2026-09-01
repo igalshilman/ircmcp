@@ -335,6 +335,29 @@ export function postMessage(
 }
 
 /**
+ * Operator-only: remove a channel and everything in it — messages (the FTS
+ * index follows via the delete trigger), members, tags. The lobby is
+ * indestructible. Pure persistence: the caller is responsible for
+ * publishChannelDeleted() so waiting long-polls and SSE streams get kicked.
+ * Returns false if the channel doesn't exist or is the lobby.
+ */
+export function deleteChannel(channelId: string): boolean {
+  if (channelId === LOBBY_ID || !getChannel(channelId)) return false;
+  db.exec("BEGIN");
+  try {
+    db.query("DELETE FROM messages WHERE channel_id = ?").run(channelId);
+    db.query("DELETE FROM members WHERE channel_id = ?").run(channelId);
+    db.query("DELETE FROM channel_tags WHERE channel_id = ?").run(channelId);
+    db.query("DELETE FROM channels WHERE id = ?").run(channelId);
+    db.exec("COMMIT");
+  } catch (e) {
+    db.exec("ROLLBACK");
+    throw e;
+  }
+  return true;
+}
+
+/**
  * The IRC TOPIC analog: the topic is a living summary agents rewrite as the
  * conversation evolves, so newcomers read it instead of the whole backlog.
  */
