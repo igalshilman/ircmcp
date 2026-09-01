@@ -53,7 +53,11 @@
   #sidebar .section-title {
     padding: 10px 14px 6px; font-size: 11px; text-transform: uppercase;
     letter-spacing: 1.5px; color: var(--dim);
+    display: flex; justify-content: space-between; align-items: center;
   }
+  #manageBtn { font-size: 10px; padding: 1px 8px; text-transform: none; letter-spacing: normal; }
+  #deleteBtn[disabled] { opacity: .45; cursor: default; }
+  #deleteBtn[disabled]:hover { background: none; }
   #channels { flex: 1; overflow-y: auto; }
   .chan {
     padding: 8px 14px; cursor: pointer; border-left: 3px solid transparent;
@@ -185,7 +189,7 @@
 </header>
 <main>
   <div id="sidebar">
-    <div class="section-title">channels</div>
+    <div class="section-title">channels <button id="manageBtn" type="button">manage</button></div>
     <div id="channels"></div>
     <div id="deleteBar" hidden>
       <button id="deleteBtn" type="button">delete selected</button>
@@ -251,11 +255,33 @@ $("gateForm").addEventListener("submit", async (e) => {
 
 // ---- channels sidebar ----
 const selected = new Set(); // channel ids checked for deletion
+let deleteMode = false;     // checkboxes only show while managing
 
 function updateDeleteBar() {
-  $("deleteBar").hidden = selected.size === 0;
-  $("deleteBtn").textContent = `delete selected (${selected.size})`;
+  $("deleteBar").hidden = !deleteMode;
+  $("deleteBtn").disabled = selected.size === 0;
+  $("deleteBtn").textContent = selected.size
+    ? `delete selected (${selected.size})`
+    : "select channels to delete";
 }
+
+function exitDeleteMode() {
+  deleteMode = false;
+  selected.clear();
+  $("manageBtn").textContent = "manage";
+  updateDeleteBar();
+}
+
+$("manageBtn").addEventListener("click", () => {
+  if (deleteMode) {
+    exitDeleteMode();
+  } else {
+    deleteMode = true;
+    $("manageBtn").textContent = "done";
+    updateDeleteBar();
+  }
+  refreshChannels();
+});
 
 async function refreshChannels() {
   const r = await api("/api/channels");
@@ -268,7 +294,7 @@ async function refreshChannels() {
   for (const c of channels) {
     const div = document.createElement("div");
     div.className = "chan" + (c.id === current ? " active" : "");
-    if (c.id !== "lobby") { // the lobby is indestructible — no checkbox
+    if (deleteMode && c.id !== "lobby") { // the lobby is indestructible — no checkbox
       const check = document.createElement("input");
       check.type = "checkbox";
       check.checked = selected.has(c.id);
@@ -412,11 +438,10 @@ $("deleteBtn").addEventListener("click", async () => {
   if (!r.ok) return;
   const { deleted } = await r.json();
   for (const id of deleted) {
-    selected.delete(id);
     delete unread[id];
     if (id === current) resetChannelView("channel deleted");
   }
-  updateDeleteBar();
+  exitDeleteMode();
   refreshChannels();
 });
 
