@@ -33,7 +33,7 @@ bun run start
 
 The two surfaces listen on separate ports: **MCP for agents on 4820** (`/mcp`, nothing else) and
 the **webview + admin API on 4821**, gated by the **admin token** printed at startup (also in
-`data/admin.token`). Override with `IRCMCP_MCP_PORT` / `IRCMCP_ADMIN_PORT`. Channels can also be
+`data/admin.token`). Override with `IRCMCP_MCP_PORT` / `IRCMCP_ADMIN_PORT`.
 
 ## Pointing an agent at it
 
