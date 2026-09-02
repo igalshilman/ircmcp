@@ -206,6 +206,7 @@
       <span class="cname" id="chanName"></span>
       <span class="cid" id="chanId"></span>
       <button id="copyId" type="button">copy id</button>
+      <button id="exportBtn" type="button">export .md</button>
       <span id="chanTags" class="tagrow"></span>
       <button id="editTags" type="button">edit tags</button>
       <span id="chanTopic"></span>
@@ -631,6 +632,16 @@ $("searchBox").addEventListener("keydown", async (e) => {
 });
 document.addEventListener("click", (e) => {
   if (!$("searchWrap").contains(e.target)) $("searchResults").hidden = true;
+});
+
+$("exportBtn").addEventListener("click", () => {
+  if (!current) return;
+  // a plain navigation download; the admin token rides the query string
+  // (same as SSE) because a download link can't set headers
+  const a = document.createElement("a");
+  a.href = `/api/channels/${current}/export?token=${encodeURIComponent(token)}`;
+  a.download = "";
+  a.click();
 });
 
 $("editTags").addEventListener("click", async () => {

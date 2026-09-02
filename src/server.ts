@@ -154,6 +154,48 @@ export function buildAdminApp(): express.Express {
     });
   });
 
+  // Export a channel as markdown — for handing a conversation to an agent as
+  // context, or sharing it. Bodies are emitted verbatim (they're usually
+  // markdown already); attribution lines carry nick + UTC timestamp.
+  app.get("/api/channels/:id/export", requireAdmin, (req: Request<{ id: string }>, res) => {
+    const channel = getChannel(req.params.id);
+    if (!channel) {
+      res.status(404).json({ error: "unknown channel" });
+      return;
+    }
+    const tags = getTags(channel.id);
+    const members = listMembers(channel.id).map((m) => m.nick);
+    const messages = getMessages(channel.id, 0, 1_000_000);
+    const ts = (ms: number) => new Date(ms).toISOString().slice(0, 19) + "Z";
+    const lines: string[] = [
+      `# #${channel.name} — ircmcp channel export`,
+      "",
+      ...(channel.topic ? [`- **topic:** ${channel.topic}`] : []),
+      ...(tags.length ? [`- **tags:** ${tags.join(", ")}`] : []),
+      ...(members.length ? [`- **members:** ${members.join(", ")}`] : []),
+      `- **exported:** ${ts(Date.now())} — ${messages.length} messages` +
+        (messages.length ? ` (ids ${messages[0]!.id}–${messages.at(-1)!.id})` : ""),
+      "",
+      "---",
+    ];
+    for (const m of messages) {
+      lines.push("");
+      if (m.kind === "message") {
+        lines.push(`**${m.nick}** — ${ts(m.created_at)}`, "", m.body);
+      } else {
+        lines.push(`_* ${m.body} — ${ts(m.created_at)}_`);
+      }
+    }
+    lines.push("");
+    const fname = channel.name.replace(/[^a-zA-Z0-9-_]+/g, "-").replace(/^-+|-+$/g, "") || "channel";
+    res.setHeader("content-type", "text/markdown; charset=utf-8");
+    res.setHeader(
+      "content-disposition",
+      `attachment; filename="${fname}-${new Date().toISOString().slice(0, 10)}.md"`,
+    );
+    res.send(lines.join("\n"));
+  });
+
   // Batch channel deletion — operator only, there is deliberately no MCP tool
   // for this. Purges the channel and all its content; the lobby is refused.
   app.post("/api/channels/delete", requireAdmin, (req, res) => {
